@@ -3,7 +3,6 @@
 
 import json
 import os
-import select
 import socket
 import subprocess
 import threading
@@ -15,6 +14,7 @@ import rumps
 import objc
 from AppKit import NSSlider, NSView, NSTextField, NSFont, NSMakeRect, NSEvent, NSSystemDefined
 from Foundation import NSObject
+from PyObjCTools import AppHelper
 
 
 STREAM_URL = "https://www.youtube.com/watch?v=jfKfPfyJRdk"
@@ -65,6 +65,10 @@ class LofiPlayer(rumps.App):
         self._build_volume_slider()
         self._setup_media_keys()
 
+    def _update_ui(self, fn):
+        """Schedule a UI update on the main thread (required by AppKit)."""
+        AppHelper.callAfter(fn)
+
     def _build_volume_slider(self):
         padding = 14
         slider_w = 160
@@ -108,13 +112,16 @@ class LofiPlayer(rumps.App):
         NX_KEYTYPE_PLAY = 16
 
         def _handle_media_key(event):
-            if event.subtype() != 8:  # 8 = subtype for media keys
-                return
-            data = event.data1()
-            key_code = (data & 0xFFFF0000) >> 16
-            key_state = (data & 0xFF00) >> 8  # 0xA = key down, 0xB = key up
-            if key_code == NX_KEYTYPE_PLAY and key_state == 0x0A:
-                self.toggle(None)
+            try:
+                if event.subtype() != 8:  # 8 = subtype for media keys
+                    return
+                data = event.data1()
+                key_code = (data & 0xFFFF0000) >> 16
+                key_state = (data & 0xFF00) >> 8  # 0xA = key down, 0xB = key up
+                if key_code == NX_KEYTYPE_PLAY and key_state == 0x0A:
+                    self.toggle(None)
+            except Exception:
+                pass
 
         NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             0x00004000,  # NSEventMaskSystemDefined (NSSystemDefinedMask)
@@ -144,66 +151,13 @@ class LofiPlayer(rumps.App):
                     f"--volume={self.volume}",
                     f"--input-ipc-server={MPV_SOCKET}",
                     "--ytdl-format=91",
-                    "--ytdl-raw-options=cookies-from-browser=chrome",
+                    "--ytdl-raw-options=cookies-from-browser=chrome,remote-components=ejs:github",
                     STREAM_URL,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self.title = "♫"
-            threading.Thread(target=self._monitor_mpv_state, daemon=True).start()
-
-    def _monitor_mpv_state(self):
-        """Watch mpv's pause property via IPC so external controls stay in sync."""
-        # Wait for socket to appear
-        for _ in range(50):
-            if os.path.exists(MPV_SOCKET):
-                break
-            time.sleep(0.1)
-        else:
-            return
-
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            sock.connect(MPV_SOCKET)
-            # Ask mpv to notify us when "pause" changes
-            cmd = json.dumps({"command": ["observe_property", 1, "pause"]})
-            sock.sendall((cmd + "\n").encode())
-            sock.setblocking(False)
-
-            buf = b""
-            while self.is_playing and self.process and self.process.poll() is None:
-                ready, _, _ = select.select([sock], [], [], 1.0)
-                if not ready:
-                    continue
-                data = sock.recv(4096)
-                if not data:
-                    break
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    try:
-                        msg = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if msg.get("event") == "property-change" and msg.get("name") == "pause":
-                        paused = msg.get("data", False)
-                        self._sync_ui_from_mpv(paused)
-            sock.close()
-        except Exception:
-            pass
-
-    def _sync_ui_from_mpv(self, mpv_paused):
-        """Update app UI to match mpv's actual pause state."""
-        if mpv_paused and self.is_playing:
-            self.is_playing = False
-            self.play_pause_button.title = "▶  Play"
-            self.title = "♪"
-        elif not mpv_paused and not self.is_playing:
-            self.is_playing = True
-            self.play_pause_button.title = "⏸  Pause"
-            self.title = "♫"
+            self._update_ui(lambda: setattr(self, 'title', '♫'))
 
     def _send_mpv_command(self, cmd):
         try:
@@ -218,11 +172,7 @@ class LofiPlayer(rumps.App):
 
     def toggle(self, _):
         if self.is_playing:
-            # Pause mpv instead of killing it
-            self._send_mpv_command({"command": ["set_property", "pause", True]})
-        elif self.process and self.process.poll() is None:
-            # mpv is still running but paused — resume it
-            self._send_mpv_command({"command": ["set_property", "pause", False]})
+            self._stop()
         else:
             self._play()
 
