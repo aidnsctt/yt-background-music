@@ -158,6 +158,32 @@ class LofiPlayer(rumps.App):
                 stderr=subprocess.DEVNULL,
             )
             self._update_ui(lambda: setattr(self, 'title', '♫'))
+            threading.Thread(target=self._poll_mpv_state, daemon=True).start()
+
+    def _poll_mpv_state(self):
+        """Poll mpv's pause property to keep UI in sync with actual playback."""
+        while self.process is not None:
+            time.sleep(1)
+            if self.process is None:
+                break
+            resp = self._send_mpv_command({"command": ["get_property", "pause"]})
+            if resp is None:
+                continue
+            paused = resp.get("data")
+            if paused is None:
+                continue
+            if paused and self.is_playing:
+                self.is_playing = False
+                self._update_ui(lambda: (
+                    setattr(self.play_pause_button, 'title', '▶  Play'),
+                    setattr(self, 'title', '♪'),
+                ))
+            elif not paused and not self.is_playing:
+                self.is_playing = True
+                self._update_ui(lambda: (
+                    setattr(self.play_pause_button, 'title', '⏸  Pause'),
+                    setattr(self, 'title', '♫'),
+                ))
 
     def _send_mpv_command(self, cmd):
         try:
@@ -165,14 +191,21 @@ class LofiPlayer(rumps.App):
             sock.settimeout(1)
             sock.connect(MPV_SOCKET)
             sock.sendall((json.dumps(cmd) + "\n").encode())
+            data = sock.recv(4096).decode()
             sock.close()
-            return True
+            return json.loads(data)
         except Exception:
-            return False
+            return None
 
     def toggle(self, _):
         if self.is_playing:
             self._stop()
+        elif self.process and self.process.poll() is None:
+            # mpv is still alive but paused externally — unpause it
+            self._send_mpv_command({"command": ["set_property", "pause", False]})
+            self.is_playing = True
+            self.play_pause_button.title = "⏸  Pause"
+            self.title = "♫"
         else:
             self._play()
 
