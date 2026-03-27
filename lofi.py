@@ -40,7 +40,7 @@ class LofiPlayer(rumps.App):
         super().__init__("♪", quit_button=None)
         self.is_playing = False
         self.process = None
-        self.volume = 30
+        self.volume = 70
         self._resolve_lock = threading.Lock()
 
         self.play_pause_button = rumps.MenuItem("▶  Play", callback=self.toggle)
