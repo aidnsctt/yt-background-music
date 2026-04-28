@@ -113,6 +113,7 @@ class LofiPlayer(rumps.App):
         # fall back to setting the underlying NSMenuItem visibility.
         self._set_item_hidden(self._error_item, True)
         self._set_item_hidden(self._retry_item, True)
+        self._set_item_hidden(self._solve_item, True)
 
         self._build_volume_slider()
         self._setup_media_keys()
@@ -263,9 +264,18 @@ class LofiPlayer(rumps.App):
                 return
             time.sleep(0.2)
 
+    def _is_bot_challenge(self, msg):
+        low = msg.lower()
+        return (
+            "sign in to confirm" in low
+            or "not a bot" in low
+            or "use --cookies" in low
+        )
+
     def _show_error_state(self):
         msg = self._last_error_line() or "Playback failed — check /tmp/lofi-player.log"
         truncated = (msg[:80] + "…") if len(msg) > 80 else msg
+        needs_challenge = self._is_bot_challenge(msg)
 
         def apply():
             self.is_playing = False
@@ -275,6 +285,7 @@ class LofiPlayer(rumps.App):
             self._error_item.title = truncated
             self._set_item_hidden(self._error_item, False)
             self._set_item_hidden(self._retry_item, False)
+            self._set_item_hidden(self._solve_item, not needs_challenge)
 
         self._update_ui(apply)
 
@@ -282,6 +293,7 @@ class LofiPlayer(rumps.App):
         def apply():
             self._set_item_hidden(self._error_item, True)
             self._set_item_hidden(self._retry_item, True)
+            self._set_item_hidden(self._solve_item, True)
             self._error_item.title = ""
 
         self._update_ui(apply)
