@@ -23,7 +23,7 @@ from PyObjCTools import AppHelper
 from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
 
 
-STREAM_URL = "https://www.youtube.com/watch?v=jfKfPfyJRdk"
+STREAM_URL = "https://www.youtube.com/watch?v=EWrX250Zhko"
 MPV_BIN = "/opt/homebrew/bin/mpv"
 MPV_SOCKET = os.path.join(tempfile.gettempdir(), "lofi-mpv.sock")
 COOKIES_FILE = os.path.join(tempfile.gettempdir(), "lofi-yt-cookies.txt")
