@@ -23,7 +23,13 @@ from PyObjCTools import AppHelper
 from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
 
 
-STREAM_URL = "https://www.youtube.com/watch?v=X4VbdwhkE10"
+# A channel /live URL re-resolves to the current live video on every mpv launch,
+# so the player heals itself when YouTube rotates the livestream's video id.
+STREAM_URL = "https://www.youtube.com/@LofiGirl/live"
+# Last-known-good watch URL, tried as the final attempt if /live can't resolve.
+FALLBACK_STREAM_URL = "https://www.youtube.com/watch?v=X4VbdwhkE10"
+MAX_AUTO_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 1.5
 MPV_BIN = "/opt/homebrew/bin/mpv"
 MPV_SOCKET = os.path.join(tempfile.gettempdir(), "lofi-mpv.sock")
 COOKIES_FILE = os.path.join(tempfile.gettempdir(), "lofi-yt-cookies.txt")
@@ -71,6 +77,7 @@ class LofiPlayer(rumps.App):
         self.is_playing = False
         self.process = None
         self.volume = 70
+        self._retry_count = 0
         self._resolve_lock = threading.Lock()
         self._stderr_buffer = collections.deque(maxlen=20)
         self._auth_window = None
@@ -230,6 +237,14 @@ class LofiPlayer(rumps.App):
 
             self._stderr_buffer.clear()
 
+            # The final auto-retry falls back to the last-known-good watch URL in
+            # case the channel /live endpoint itself can't resolve a live video.
+            url = (
+                FALLBACK_STREAM_URL
+                if self._retry_count >= MAX_AUTO_RETRIES
+                else STREAM_URL
+            )
+
             self.process = subprocess.Popen(
                 [
                     MPV_BIN,
@@ -239,7 +254,7 @@ class LofiPlayer(rumps.App):
                     f"--input-ipc-server={MPV_SOCKET}",
                     "--ytdl-format=91",
                     f"--ytdl-raw-options={self._build_ytdl_raw_options()}",
-                    STREAM_URL,
+                    url,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -251,7 +266,9 @@ class LofiPlayer(rumps.App):
             threading.Thread(
                 target=self._watch_for_early_exit, args=(self.process,), daemon=True
             ).start()
-            threading.Thread(target=self._poll_mpv_state, daemon=True).start()
+            threading.Thread(
+                target=self._poll_mpv_state, args=(self.process,), daemon=True
+            ).start()
 
     def _watch_for_early_exit(self, proc):
         """If mpv exits within EARLY_EXIT_SECONDS, treat as a failure."""
@@ -260,9 +277,36 @@ class LofiPlayer(rumps.App):
             if proc.poll() is not None:
                 # Give the stderr drain a moment to catch up.
                 time.sleep(0.3)
-                self._show_error_state()
+                self._handle_unexpected_exit(proc)
                 return
             time.sleep(0.2)
+        # Survived startup — playback is healthy, so reset the retry budget.
+        self._retry_count = 0
+
+    def _handle_unexpected_exit(self, proc):
+        """Decide what to do when mpv dies unexpectedly: auto-retry or surface an
+        error. Both watcher threads route through here; the lock + identity check
+        ensure a single death is handled exactly once."""
+        with self._resolve_lock:
+            if self.process is not proc:
+                return  # another watcher already handled this death
+            self.process = None  # claim it; also stops _poll_mpv_state's loop
+            msg = self._last_error_line()
+            if self._is_bot_challenge(msg):
+                decision = "error"  # never auto-retry — needs a manual solve
+            elif self._retry_count < MAX_AUTO_RETRIES:
+                self._retry_count += 1
+                decision = "retry"
+            else:
+                decision = "error"
+
+        if decision == "retry":
+            self._update_ui(lambda: setattr(self, "title", "♪…"))  # reconnecting
+            time.sleep(RETRY_BACKOFF_SECONDS)
+            if self.is_playing:  # bail if the user hit Stop during the backoff
+                self._start_playback()
+        else:
+            self._show_error_state()
 
     def _is_bot_challenge(self, msg):
         low = msg.lower()
@@ -306,16 +350,17 @@ class LofiPlayer(rumps.App):
     def _on_solve_clicked(self, _):
         self._open_yt_auth_window()
 
-    def _poll_mpv_state(self):
-        """Poll mpv's pause property to keep UI in sync with actual playback."""
-        while self.process is not None:
+    def _poll_mpv_state(self, proc):
+        """Poll mpv's pause property to keep UI in sync with actual playback.
+        Bound to one mpv process so it retires when a reconnect supersedes it."""
+        while self.process is proc:
             time.sleep(1)
-            proc = self.process
-            if proc is None:
+            if self.process is not proc:
                 break
             if proc.poll() is not None:
-                # mpv died after startup. Surface the failure.
-                self._show_error_state()
+                # mpv died after startup (e.g. the live stream ended). Try to
+                # auto-heal by reconnecting; falls back to an error if needed.
+                self._handle_unexpected_exit(proc)
                 break
             resp = self._send_mpv_command({"command": ["get_property", "pause"]})
             if resp is None:
@@ -362,6 +407,7 @@ class LofiPlayer(rumps.App):
 
     def _play(self):
         self._clear_error_state()
+        self._retry_count = 0
         self.is_playing = True
         self.play_pause_button.title = "⏸  Pause"
         self.title = "♪…"
