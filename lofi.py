@@ -80,6 +80,11 @@ class _AuthWindowDelegate(NSObject):
 class LofiPlayer(rumps.App):
     def __init__(self):
         super().__init__("♪", quit_button=None)
+        # Run as a menu-bar-only background app: no Dock icon, no app switcher
+        # entry. The auth-window flow flips to Regular and back to Accessory.
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
         self.is_playing = False
         self.process = None
         self.volume = 70
