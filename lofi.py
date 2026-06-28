@@ -21,6 +21,7 @@ from AppKit import (
 from Foundation import NSObject, NSURL, NSURLRequest
 from PyObjCTools import AppHelper
 from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
+import Quartz
 
 
 # A channel /live URL re-resolves to the current live video on every mpv launch,
@@ -43,6 +44,11 @@ SAFARI_UA = (
     "Version/17.0 Safari/605.1.15"
 )
 EARLY_EXIT_SECONDS = 6
+
+# Media-key plumbing. NX_SYSDEFINED (14) is the CGEvent type that carries
+# Apple's special keys; key code 16 (NX_KEYTYPE_PLAY) is Play/Pause.
+NX_SYSDEFINED = 14
+NX_KEYTYPE_PLAY = 16
 
 
 class SliderTarget(NSObject):
@@ -83,6 +89,8 @@ class LofiPlayer(rumps.App):
         self._auth_window = None
         self._auth_window_delegate = None
         self._auth_web_view = None
+        self._event_tap = None
+        self._event_tap_source = None
 
         self.play_pause_button = rumps.MenuItem("▶  Play", callback=self.toggle)
 
@@ -174,23 +182,85 @@ class LofiPlayer(rumps.App):
         self._volume_item._menuitem.setView_(container)
 
     def _setup_media_keys(self):
-        """Listen for media key events (play/pause on Apple keyboard)."""
-        NX_KEYTYPE_PLAY = 16
+        """Make the keyboard's Play/Pause key toggle THIS player instead of
+        launching Apple Music.
 
+        A passive NSEvent global monitor can only *observe* the key — macOS still
+        delivers Play to the system, which launches Music. So we install a
+        CGEventTap at the session tap head: it receives the system-defined
+        media-key event first and returns None to swallow it (the same trick
+        BeardedSpice/noTunes use). This needs Accessibility permission; if the
+        tap can't be created we fall back to the passive monitor so the key at
+        least toggles us (Music will still pop up until permission is granted)."""
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault,  # active tap — may consume events
+            Quartz.CGEventMaskBit(NX_SYSDEFINED),
+            self._media_key_tap_callback,
+            None,
+        )
+        self._event_tap = tap
+        if tap is None:
+            # No Accessibility permission yet — degrade to a passive monitor.
+            print(
+                "media-keys: CGEventTap unavailable (grant Accessibility "
+                "permission to this Python binary) — falling back to passive "
+                "monitor; Apple Music will still open on Play.",
+                file=sys.stderr, flush=True,
+            )
+            self._setup_media_keys_passive()
+            return
+        print("media-keys: CGEventTap active — Play/Pause is captured.",
+              file=sys.stderr, flush=True)
+
+        source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        self._event_tap_source = source
+        Quartz.CFRunLoopAddSource(
+            Quartz.CFRunLoopGetCurrent(), source, Quartz.kCFRunLoopCommonModes
+        )
+        Quartz.CGEventTapEnable(tap, True)
+
+    def _media_key_tap_callback(self, proxy, event_type, cg_event, refcon):
+        # The OS disables a tap that's too slow or interrupted; re-enable it.
+        if event_type in (
+            Quartz.kCGEventTapDisabledByTimeout,
+            Quartz.kCGEventTapDisabledByUserInput,
+        ):
+            if self._event_tap is not None:
+                Quartz.CGEventTapEnable(self._event_tap, True)
+            return cg_event
+        try:
+            ns_event = NSEvent.eventWithCGEvent_(cg_event)
+            if ns_event is not None and ns_event.subtype() == 8:  # 8 = media keys
+                data = ns_event.data1()
+                key_code = (data & 0xFFFF0000) >> 16
+                key_state = (data & 0xFF00) >> 8  # 0x0A = down, 0x0B = up
+                if key_code == NX_KEYTYPE_PLAY:
+                    if key_state == 0x0A:  # act only on key-down
+                        self.toggle(None)
+                    return None  # swallow down+up so Apple Music never sees it
+        except Exception:
+            pass
+        return cg_event
+
+    def _setup_media_keys_passive(self):
+        """Fallback when no Accessibility permission: observe the Play key and
+        toggle, but we can't stop Music from also opening."""
         def _handle_media_key(event):
             try:
-                if event.subtype() != 8:  # 8 = subtype for media keys
+                if event.subtype() != 8:
                     return
                 data = event.data1()
                 key_code = (data & 0xFFFF0000) >> 16
-                key_state = (data & 0xFF00) >> 8  # 0xA = key down, 0xB = key up
+                key_state = (data & 0xFF00) >> 8
                 if key_code == NX_KEYTYPE_PLAY and key_state == 0x0A:
                     self.toggle(None)
             except Exception:
                 pass
 
         NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
-            0x00004000,  # NSEventMaskSystemDefined (NSSystemDefinedMask)
+            0x00004000,  # NSEventMaskSystemDefined
             _handle_media_key,
         )
 
