@@ -250,6 +250,10 @@ class LofiPlayer(rumps.App):
                     MPV_BIN,
                     "--no-video",
                     "--no-terminal",
+                    # Don't let mpv grab macOS media keys and toggle its own
+                    # internal pause — the app owns play/stop, and a self-paused
+                    # mpv would keep the process + YouTube connection alive.
+                    "--input-media-keys=no",
                     f"--volume={self.volume}",
                     f"--input-ipc-server={MPV_SOCKET}",
                     "--ytdl-format=91",
@@ -351,7 +355,9 @@ class LofiPlayer(rumps.App):
         self._open_yt_auth_window()
 
     def _poll_mpv_state(self, proc):
-        """Poll mpv's pause property to keep UI in sync with actual playback.
+        """Watch for mpv dying after a healthy start (e.g. the live stream
+        ended) and auto-heal. mpv can't pause itself (--input-media-keys=no) and
+        the app never pauses via IPC, so the only state worth watching is death.
         Bound to one mpv process so it retires when a reconnect supersedes it."""
         while self.process is proc:
             time.sleep(1)
@@ -362,24 +368,6 @@ class LofiPlayer(rumps.App):
                 # auto-heal by reconnecting; falls back to an error if needed.
                 self._handle_unexpected_exit(proc)
                 break
-            resp = self._send_mpv_command({"command": ["get_property", "pause"]})
-            if resp is None:
-                continue
-            paused = resp.get("data")
-            if paused is None:
-                continue
-            if paused and self.is_playing:
-                self.is_playing = False
-                self._update_ui(lambda: (
-                    setattr(self.play_pause_button, 'title', '▶  Play'),
-                    setattr(self, 'title', '♪'),
-                ))
-            elif not paused and not self.is_playing:
-                self.is_playing = True
-                self._update_ui(lambda: (
-                    setattr(self.play_pause_button, 'title', '⏸  Pause'),
-                    setattr(self, 'title', '♫'),
-                ))
 
     def _send_mpv_command(self, cmd):
         try:
@@ -394,14 +382,12 @@ class LofiPlayer(rumps.App):
             return None
 
     def toggle(self, _):
+        # Stop fully tears down mpv (process + stream); Play always starts a
+        # fresh stream. There is deliberately no "resume" — a live radio stream
+        # can't be resumed mid-point, and a kept-alive mpv would leave a YouTube
+        # connection running in the background.
         if self.is_playing:
             self._stop()
-        elif self.process and self.process.poll() is None:
-            # mpv is still alive but paused externally — unpause it
-            self._send_mpv_command({"command": ["set_property", "pause", False]})
-            self.is_playing = True
-            self.play_pause_button.title = "⏸  Pause"
-            self.title = "♫"
         else:
             self._play()
 
@@ -409,7 +395,7 @@ class LofiPlayer(rumps.App):
         self._clear_error_state()
         self._retry_count = 0
         self.is_playing = True
-        self.play_pause_button.title = "⏸  Pause"
+        self.play_pause_button.title = "⏹  Stop"
         self.title = "♪…"
         threading.Thread(target=self._start_playback, daemon=True).start()
 
