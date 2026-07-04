@@ -278,11 +278,13 @@ class LofiPlayer(rumps.App):
         self._send_mpv_command({"command": ["set_property", "volume", self.volume]})
 
     def _build_ytdl_raw_options(self):
+        # Anonymous by default. Signed-in account cookies (e.g. Chrome's) make
+        # yt-dlp switch to the "tv downgraded" player client, which YouTube now
+        # serves zero formats — extraction fails with "No video formats found".
+        # Only the cookies exported by the in-app challenge solver are used.
         if os.path.exists(COOKIES_FILE):
-            cookies_part = f"cookies={COOKIES_FILE}"
-        else:
-            cookies_part = "cookies-from-browser=chrome"
-        return f"{cookies_part},remote-components=ejs:github"
+            return f"cookies={COOKIES_FILE},remote-components=ejs:github"
+        return "remote-components=ejs:github"
 
     def _drain_stderr(self, stream):
         try:
