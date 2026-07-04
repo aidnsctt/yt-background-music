@@ -20,7 +20,10 @@ if [ -z "${PYTHON:-}" ]; then
     exit 1
 fi
 
-pkill -f "python3.*lofi.py" 2>/dev/null || true
+# Match on the script name only: the venv's python3 resolves to the framework
+# binary ".../Python.app/Contents/MacOS/Python", so "python3.*lofi.py" never
+# matched and old instances survived restarts.
+pkill -f "lofi.py" 2>/dev/null || true
 pkill -f "mpv.*lofi-mpv" 2>/dev/null || true
 sleep 0.5
 

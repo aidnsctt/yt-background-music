@@ -65,3 +65,27 @@ is no Dock icon or app-switcher entry. The auth-window flow temporarily flips to
 Regular and reverts on close.
 **Why:** It's a background music controller — a Dock icon is noise. Accessory
 policy matches the intent of an always-running menu-bar utility.
+
+## 2026-07-04 — Anonymous yt-dlp by default; no more Chrome cookies
+**Decision:** Stop passing `cookies-from-browser=chrome` to yt-dlp as the default.
+Extraction now runs anonymously (JS challenges solved via `remote-components=
+ejs:github` + deno); only the cookies exported by the in-app challenge solver
+(2026-04-28 entry) are still used, when that file exists.
+**Why:** Playback broke completely: with signed-in YouTube account cookies,
+yt-dlp (2026.06.09, latest) switches to the "tv downgraded" player client, which
+YouTube now serves zero formats — every attempt failed with "No video formats
+found". The identical extraction without cookies succeeds. Chrome's cookies were
+only ever a convenience fallback for bot checks; anonymous + the EJS challenge
+solver is the path yt-dlp actually supports today.
+**Trade-off:** If YouTube raises a bot challenge for anonymous traffic, the user
+must solve it once via the "Solve YouTube challenge…" window (that flow is
+unchanged).
+
+## 2026-07-04 — Fix restart.sh kill pattern (`lofi.py`, not `python3.*lofi.py`)
+**Decision:** `restart.sh` now kills old instances with `pkill -f "lofi.py"`.
+**Why:** The venv's `python3` resolves to the framework binary
+`…/Python.app/Contents/MacOS/Python`, so the old pattern `python3.*lofi.py`
+never matched a running player. Restarts silently left old instances alive — a
+ghost player from the project's previous directory (`yt-background-music`,
+since deleted) had been running for days with its own menu-bar icon and
+media-key handler.
