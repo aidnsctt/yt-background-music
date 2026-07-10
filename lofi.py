@@ -187,8 +187,8 @@ class LofiPlayer(rumps.App):
         self._volume_item._menuitem.setView_(container)
 
     def _setup_media_keys(self):
-        """Make the keyboard's Play/Pause key toggle THIS player instead of
-        launching Apple Music.
+        """Make the keyboard's Play/Pause key stop THIS player — but only while
+        this player is the one making sound.
 
         A passive NSEvent global monitor can only *observe* the key — macOS still
         delivers Play to the system, which launches Music. So we install a
@@ -196,7 +196,12 @@ class LofiPlayer(rumps.App):
         media-key event first and returns None to swallow it (the same trick
         BeardedSpice/noTunes use). This needs Accessibility permission; if the
         tap can't be created we fall back to the passive monitor so the key at
-        least toggles us (Music will still pop up until permission is granted)."""
+        least stops us (Music will still pop up until permission is granted).
+
+        The tap stays installed at all times, but it only *claims* the key when
+        we're playing (see _owns_media_keys). While we're stopped the event is
+        passed straight through, so Spotify, YouTube, and the rest of macOS keep
+        their normal Play/Pause behavior."""
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
@@ -241,7 +246,7 @@ class LofiPlayer(rumps.App):
                 data = ns_event.data1()
                 key_code = (data & 0xFFFF0000) >> 16
                 key_state = (data & 0xFF00) >> 8  # 0x0A = down, 0x0B = up
-                if key_code == NX_KEYTYPE_PLAY:
+                if key_code == NX_KEYTYPE_PLAY and self._owns_media_keys():
                     if key_state == 0x0A:  # act only on key-down
                         self.toggle(None)
                     return None  # swallow down+up so Apple Music never sees it
@@ -249,9 +254,15 @@ class LofiPlayer(rumps.App):
             pass
         return cg_event
 
+    def _owns_media_keys(self):
+        """True only while this player is the active audio source. When it is
+        stopped the Play key belongs to whatever else is playing (Spotify, a
+        YouTube tab, Apple Music), so we must not swallow the event."""
+        return self.is_playing
+
     def _setup_media_keys_passive(self):
         """Fallback when no Accessibility permission: observe the Play key and
-        toggle, but we can't stop Music from also opening."""
+        stop playback, but we can't stop Music from also opening."""
         def _handle_media_key(event):
             try:
                 if event.subtype() != 8:
@@ -259,7 +270,11 @@ class LofiPlayer(rumps.App):
                 data = event.data1()
                 key_code = (data & 0xFFFF0000) >> 16
                 key_state = (data & 0xFF00) >> 8
-                if key_code == NX_KEYTYPE_PLAY and key_state == 0x0A:
+                if (
+                    key_code == NX_KEYTYPE_PLAY
+                    and key_state == 0x0A
+                    and self._owns_media_keys()
+                ):
                     self.toggle(None)
             except Exception:
                 pass

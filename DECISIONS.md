@@ -89,3 +89,22 @@ never matched a running player. Restarts silently left old instances alive — a
 ghost player from the project's previous directory (`yt-background-music`,
 since deleted) had been running for days with its own menu-bar icon and
 media-key handler.
+
+## 2026-07-10 — Only capture the Play/Pause key while we are playing
+**Decision:** The CGEventTap stays installed at all times, but it now swallows
+the Play/Pause key only when `self.is_playing` is true (`_owns_media_keys()`).
+When the player is stopped, the event is passed through untouched. The passive
+fallback monitor follows the same rule.
+**Why:** This reverses part of the original media-key design (2026-04-27 —
+"Capture the media Play/Pause key with a CGEventTap"), which swallowed the key
+unconditionally. That made the lofi player hog the binding system-wide: pressing
+Play/Pause while watching YouTube or listening to Spotify did not pause them —
+it started the lofi stream instead. Ownership of the transport key belongs to
+whichever player is currently making sound, so we only claim it when we are that
+player.
+**Trade-off:** The Play/Pause key can no longer *start* lofi from a stopped
+state — it can only stop it. Starting is done from the menu bar. This is the
+right side of the trade: a background app that is silent should never intercept
+a key meant for the app the user is actually listening to. There is no way to
+have both, because the tap must decide to swallow or pass the event before
+knowing the user's intent.
