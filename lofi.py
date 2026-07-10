@@ -2,9 +2,11 @@
 """Lofi Hip Hop Radio — macOS menu bar audio player."""
 
 import collections
+import ctypes
 import json
 import os
 import socket
+import struct
 import subprocess
 import threading
 import signal
@@ -51,6 +53,92 @@ NX_SYSDEFINED = 14
 NX_KEYTYPE_PLAY = 16
 
 
+class AudioSessions:
+    """Ask CoreAudio which processes currently hold an output audio session.
+
+    Used to decide whether some *other* app owns the Play/Pause key. A process
+    shows up here while it is playing AND while it is merely paused (verified on
+    macOS 26.5 with QuickTime), which is exactly the ownership rule we want: if a
+    YouTube video is paused, Play should resume that video, not start lofi.
+
+    Public CoreAudio API (process objects, macOS 14.4+). We do NOT use the
+    private MediaRemote framework: since macOS 15.4 its now-playing queries
+    return nothing to unentitled processes — verified on 26.5, where
+    MRMediaRemoteGetNowPlayingApplicationIsPlaying reports False even while
+    QuickTime is audibly playing.
+    """
+
+    _GLOBAL = struct.unpack(">I", b"glob")[0]
+    _PROCESS_LIST = struct.unpack(">I", b"prs#")[0]   # kAudioHardwarePropertyProcessObjectList
+    _PID = struct.unpack(">I", b"ppid")[0]            # kAudioProcessPropertyPID
+    _IS_RUNNING_OUTPUT = struct.unpack(">I", b"piro")[0]  # kAudioProcessPropertyIsRunningOutput
+    _SYSTEM_OBJECT = 1
+
+    class _Address(ctypes.Structure):
+        _fields_ = [
+            ("mSelector", ctypes.c_uint32),
+            ("mScope", ctypes.c_uint32),
+            ("mElement", ctypes.c_uint32),
+        ]
+
+    def __init__(self):
+        self._ca = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+        )
+
+    def _get(self, obj, selector, ctype):
+        addr = self._Address(selector, self._GLOBAL, 0)
+        out = ctype()
+        size = ctypes.c_uint32(ctypes.sizeof(ctype))
+        err = self._ca.AudioObjectGetPropertyData(
+            ctypes.c_uint32(obj), ctypes.byref(addr),
+            ctypes.c_uint32(0), None, ctypes.byref(size), ctypes.byref(out),
+        )
+        if err:
+            raise OSError(f"AudioObjectGetPropertyData(sel={selector}) err={err}")
+        return out.value
+
+    def _process_objects(self):
+        addr = self._Address(self._PROCESS_LIST, self._GLOBAL, 0)
+        size = ctypes.c_uint32(0)
+        err = self._ca.AudioObjectGetPropertyDataSize(
+            ctypes.c_uint32(self._SYSTEM_OBJECT), ctypes.byref(addr),
+            ctypes.c_uint32(0), None, ctypes.byref(size),
+        )
+        if err:
+            raise OSError(f"AudioObjectGetPropertyDataSize err={err}")
+        count = size.value // ctypes.sizeof(ctypes.c_uint32)
+        buf = (ctypes.c_uint32 * count)()
+        err = self._ca.AudioObjectGetPropertyData(
+            ctypes.c_uint32(self._SYSTEM_OBJECT), ctypes.byref(addr),
+            ctypes.c_uint32(0), None, ctypes.byref(size), buf,
+        )
+        if err:
+            raise OSError(f"AudioObjectGetPropertyData(process list) err={err}")
+        return buf[: size.value // ctypes.sizeof(ctypes.c_uint32)]
+
+    def other_app_holds_output(self, exclude_pids):
+        """True if a process other than ours holds an output session.
+
+        Fails open (returns True) if CoreAudio can't answer: better to let the
+        key through to whatever else might be playing than to hijack it.
+        """
+        try:
+            objects = self._process_objects()
+        except OSError:
+            return True
+        for obj in objects:
+            try:
+                if not self._get(obj, self._IS_RUNNING_OUTPUT, ctypes.c_uint32):
+                    continue
+                pid = self._get(obj, self._PID, ctypes.c_int32)
+            except OSError:
+                continue
+            if pid not in exclude_pids:
+                return True
+        return False
+
+
 class SliderTarget(NSObject):
     def initWithCallback_(self, callback):
         self = objc.super(SliderTarget, self).init()
@@ -87,6 +175,9 @@ class LofiPlayer(rumps.App):
         )
         self.is_playing = False
         self.process = None
+        # Kept after self.process is cleared so _own_pids() can still recognise a
+        # dying mpv as ours.
+        self._last_process = None
         self.volume = 70
         self._retry_count = 0
         self._resolve_lock = threading.Lock()
@@ -96,6 +187,7 @@ class LofiPlayer(rumps.App):
         self._auth_web_view = None
         self._event_tap = None
         self._event_tap_source = None
+        self._audio_sessions = self._make_audio_sessions()
 
         self.play_pause_button = rumps.MenuItem("▶  Play", callback=self.toggle)
 
@@ -137,6 +229,27 @@ class LofiPlayer(rumps.App):
 
         self._build_volume_slider()
         self._setup_media_keys()
+
+    def _make_audio_sessions(self):
+        """Build the CoreAudio probe, proving it works before we trust it.
+
+        The process-object API is macOS 14.4+. On anything older the selectors
+        are unknown and every query errors; probing once here means the media-key
+        path can treat `None` as "can't tell" instead of guessing per keypress.
+        """
+        try:
+            sessions = AudioSessions()
+            # Probe the raw call, not other_app_holds_output() — that one fails
+            # open and would swallow the very error we're testing for.
+            sessions._process_objects()
+            return sessions
+        except Exception as exc:
+            print(
+                f"media-keys: CoreAudio process objects unavailable ({exc}) — "
+                "Play/Pause will only stop the player, never start it.",
+                file=sys.stderr, flush=True,
+            )
+            return None
 
     def _set_item_hidden(self, item, hidden):
         try:
@@ -199,9 +312,10 @@ class LofiPlayer(rumps.App):
         least stops us (Music will still pop up until permission is granted).
 
         The tap stays installed at all times, but it only *claims* the key when
-        we're playing (see _owns_media_keys). While we're stopped the event is
-        passed straight through, so Spotify, YouTube, and the rest of macOS keep
-        their normal Play/Pause behavior."""
+        we own it (see _owns_media_keys): when we're playing, or when no other
+        app holds an audio session. Otherwise the event is passed straight
+        through, so Spotify, YouTube, and the rest of macOS keep their normal
+        Play/Pause behavior."""
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,
             Quartz.kCGHeadInsertEventTap,
@@ -255,10 +369,36 @@ class LofiPlayer(rumps.App):
         return cg_event
 
     def _owns_media_keys(self):
-        """True only while this player is the active audio source. When it is
-        stopped the Play key belongs to whatever else is playing (Spotify, a
-        YouTube tab, Apple Music), so we must not swallow the event."""
-        return self.is_playing
+        """Decide whether the Play/Pause key belongs to us on this press.
+
+        Three cases:
+          1. We're playing            -> ours; the key stops us.
+          2. Another app holds an     -> theirs; pass the key through so Spotify
+             output audio session        or a YouTube tab plays/pauses normally.
+             (playing or paused)
+          3. Nothing else holds one   -> ours; the key starts us.
+
+        Case 2 covers paused apps on purpose: a paused YouTube video should
+        resume on Play, not be shadowed by lofi starting up.
+        """
+        if self.is_playing:
+            return True
+        if self._audio_sessions is None:
+            return False  # can't tell who else is around; never hijack the key
+        return not self._audio_sessions.other_app_holds_output(self._own_pids())
+
+    def _own_pids(self):
+        """Pids whose audio sessions are ours, not "another app's".
+
+        Includes an mpv that is still winding down: _stop() clears self.process
+        and then terminates it, so for a moment a dying mpv still holds an output
+        session. Without this, a Play press right after Stop would see that
+        session, conclude another app owns the key, and refuse to start."""
+        pids = {os.getpid()}
+        for proc in (self.process, self._last_process):
+            if proc is not None and proc.poll() is None:
+                pids.add(proc.pid)
+        return pids
 
     def _setup_media_keys_passive(self):
         """Fallback when no Accessibility permission: observe the Play key and
@@ -355,6 +495,7 @@ class LofiPlayer(rumps.App):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
+            self._last_process = self.process
             threading.Thread(
                 target=self._drain_stderr, args=(self.process.stderr,), daemon=True
             ).start()

@@ -108,3 +108,33 @@ right side of the trade: a background app that is silent should never intercept
 a key meant for the app the user is actually listening to. There is no way to
 have both, because the tap must decide to swallow or pass the event before
 knowing the user's intent.
+
+## 2026-07-10 — Claim the Play/Pause key when no other app holds an audio session
+**Decision:** `_owns_media_keys()` now answers three cases instead of two: if we
+are playing, the key is ours (it stops us); if another process holds a CoreAudio
+*output session*, the key is theirs and we pass the event through; if nobody
+else holds one, the key is ours and it starts us. Ownership is read from the
+public CoreAudio process-object API (`kAudioHardwarePropertyProcessObjectList` +
+`kAudioProcessPropertyIsRunningOutput`, macOS 14.4+), via ctypes.
+**Why:** This restores the ability to *start* lofi from the keyboard, which the
+earlier entry today ("Only capture the Play/Pause key while we are playing")
+gave up as an unavoidable trade-off. It turned out to be avoidable: we can ask
+the OS who owns the transport key rather than guessing.
+**Why not MediaRemote:** The obvious tool is the private MediaRemote framework
+(`MRMediaRemoteGetNowPlayingApplicationIsPlaying`). Measured on macOS 26.5, its
+symbols still load and its callbacks still fire, but it reports
+`isPlaying=False` / `nowPlayingInfo=None` even while QuickTime is audibly
+playing — Apple gated now-playing data behind an entitlement in macOS 15.4. It
+is a dead end, not just a risky one. `kAudioDevicePropertyDeviceIsRunning-
+Somewhere` was also rejected: it reads 1 whenever the output device is live, so
+it cannot tell one app from another.
+**A paused app still counts as an owner.** Verified: QuickTime keeps its output
+session while paused. This is deliberate and correct — if a YouTube video is
+paused, Play should resume *that video*, not start lofi over the top of it.
+**Trade-off:** Any app holding an output session blocks the key from starting
+lofi, including a Chrome tab that merely has a paused video (Chrome keeps the
+stream open). On a Mac with such a tab open, Play/Pause will still not start
+lofi; the menu bar always works. This is the conservative direction on purpose:
+the failure mode is "lofi doesn't start", never "lofi hijacks someone else's
+key". For the same reason the CoreAudio probe fails open — any error, or a
+pre-14.4 macOS, degrades to the stop-only behavior rather than guessing.
