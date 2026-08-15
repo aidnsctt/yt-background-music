@@ -50,12 +50,20 @@ EARLY_EXIT_SECONDS = 6
 # and reconnect from scratch. mpv keeps running (and reports pause=false) when a
 # live stream stalls, so process death alone can't detect it.
 #
-# This is deliberately long. Measured on the LofiGirl stream: with ffmpeg's
-# reconnect options (below) a stall recovered on its own after 46s. A restart
-# costs several seconds of silence plus a fresh yt-dlp resolve, so it is only
-# worth doing once self-healing has clearly failed — hence ~2x the observed
-# worst-case recovery.
-STALL_TIMEOUT_SECONDS = 90
+# Covers the case where bytes are still trickling in but playback never
+# resumes. A restart costs a few seconds of silence plus a fresh yt-dlp
+# resolve, so give a genuine rebuffer room to finish first.
+STALL_TIMEOUT_SECONDS = 60
+# The faster path out of a stall. The clock above can't tell "buffer is
+# refilling, nearly there" from "the connection is dead", so it has to assume
+# the hopeful case and wait. `demuxer-cache-time` does tell them apart: it only
+# moves when bytes actually arrive. If it has not moved at all, nothing is being
+# received and waiting out the longer timeout just adds silence.
+#
+# Measured wedge: cache advanced once to 88% buffered, then stopped dead with
+# playback still frozen — mpv sat waiting forever for a buffer that would never
+# fill. That state is unrecoverable and is what this catches.
+NO_DATA_TIMEOUT_SECONDS = 30
 
 # Media-key plumbing. NX_SYSDEFINED (14) is the CGEvent type that carries
 # Apple's special keys; key code 16 (NX_KEYTYPE_PLAY) is Play/Pause.
@@ -496,14 +504,25 @@ class LofiPlayer(rumps.App):
                     # internal pause — the app owns play/stop, and a self-paused
                     # mpv would keep the process + YouTube connection alive.
                     "--input-media-keys=no",
-                    # Let ffmpeg re-open the HTTP connection when the live
-                    # stream drops mid-play. Without this mpv wedges in
-                    # paused-for-cache forever: still running, pause=false, but
-                    # silent — the app looks like it's playing with no sound.
-                    # Measured: turns an otherwise permanent stall into a ~46s
-                    # gap that recovers by itself.
-                    "--stream-lavf-o=reconnect=1,reconnect_streamed=1,"
-                    "reconnect_delay_max=5",
+                    # Start ~60s behind the HLS live edge and keep a deep
+                    # buffer. This is what actually stops the "playing but
+                    # silent" bug: at the live edge mpv has no cushion, so the
+                    # first delivery hiccup empties the buffer and it wedges in
+                    # paused-for-cache forever. Measured side by side on the
+                    # same stream: live-edge mpv played 0.0s of audio in 95s
+                    # while this config played 95.1s and held its 60s cushion
+                    # throughout.
+                    #
+                    # Being a minute behind live is meaningless for a radio
+                    # stream, so the cushion is nearly free.
+                    #
+                    # NOTE: do NOT add ffmpeg's `reconnect` options via
+                    # --stream-lavf-o here. Tried and reverted — see
+                    # DECISIONS.md 2026-08-15.
+                    "--demuxer-lavf-o=live_start_index=-12",
+                    "--cache=yes",
+                    "--cache-secs=180",
+                    "--demuxer-readahead-secs=180",
                     f"--volume={self.volume}",
                     f"--input-ipc-server={MPV_SOCKET}",
                     "--ytdl-format=91",
@@ -617,11 +636,17 @@ class LofiPlayer(rumps.App):
            leaves it in paused-for-cache/core-idle forever with pause=false, so
            the app looks like it is playing while the room is silent.
 
-        Case 2 is invisible to process death, so we watch the playback clock
-        instead: if time-pos stops advancing, the stream is gone. Bound to one
-        mpv process so it retires when a reconnect supersedes it."""
+        Case 2 is invisible to process death, so we watch two clocks instead:
+        `time-pos` (is sound coming out?) and `demuxer-cache-time` (are bytes
+        still arriving?). Frozen playback while the cache still fills is an
+        ordinary rebuffer and gets the long grace period; frozen playback with a
+        frozen cache means nothing is arriving at all, and gets cut short.
+        Bound to one mpv process so it retires when a reconnect supersedes it."""
         last_pos = None
-        last_progress = time.time()
+        last_cache = None
+        now = time.time()
+        last_progress = now  # playback clock last moved
+        last_data = now      # new bytes last arrived
 
         while self.process is proc:
             time.sleep(1)
@@ -634,24 +659,37 @@ class LofiPlayer(rumps.App):
                 break
 
             pos = self._get_mpv_property("time-pos")
+            cache = self._get_mpv_property("demuxer-cache-time")
             now = time.time()
+
             # None means "no reading" (still loading, or IPC hiccup) — that is
             # not evidence of a stall, so only a repeated identical clock counts.
+            if cache is None or cache != last_cache:
+                last_cache = cache
+                last_data = now
+
             if pos is None or pos != last_pos:
                 last_pos = pos
                 last_progress = now
                 continue
 
-            if now - last_progress >= STALL_TIMEOUT_SECONDS:
-                # Alive but silent. Kill it ourselves, otherwise the stuck mpv
-                # lingers holding the socket and its dead YouTube connection.
-                self._stderr_buffer.append(
-                    "Stream stalled — no audio for "
-                    f"{STALL_TIMEOUT_SECONDS}s (connection dropped)"
-                )
-                self._terminate(proc)
-                self._handle_unexpected_exit(proc, stalled=True)
-                break
+            # Playback is frozen. How long we tolerate it depends on whether the
+            # stream is still feeding us anything.
+            starved_for = now - last_data
+            stalled_for = now - last_progress
+            if starved_for >= NO_DATA_TIMEOUT_SECONDS:
+                reason = f"no data received for {int(starved_for)}s"
+            elif stalled_for >= STALL_TIMEOUT_SECONDS:
+                reason = f"buffering for {int(stalled_for)}s without recovering"
+            else:
+                continue
+
+            # Alive but silent. Kill it ourselves, otherwise the stuck mpv
+            # lingers holding the socket and its dead YouTube connection.
+            self._stderr_buffer.append(f"Stream stalled — {reason}")
+            self._terminate(proc)
+            self._handle_unexpected_exit(proc, stalled=True)
+            break
 
     def _send_mpv_command(self, cmd):
         try:

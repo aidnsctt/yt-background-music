@@ -173,3 +173,41 @@ a stale challenge warning from an earlier attempt and that would wrongly block
 the reconnect. `_stop` now escalates SIGTERM to SIGKILL on a background thread —
 a stalled mpv can ignore SIGTERM, and waiting on the main thread would freeze
 the menu bar.
+
+## 2026-08-15 — Buffer behind the live edge (the actual stall fix)
+**Decision:** mpv now starts ~60s behind the HLS live edge and keeps a deep
+buffer: `--demuxer-lavf-o=live_start_index=-12`, `--cache=yes`,
+`--cache-secs=180`, `--demuxer-readahead-secs=180`.
+**Why:** This is the root cause of "the menu says playing but there is no
+sound". At the live edge mpv has no cushion, so the first delivery hiccup
+empties the buffer and it wedges in `paused-for-cache` permanently — alive,
+`pause=false`, silent. Measured side by side on the same stream in the same
+95s window: the live-edge player produced **0.0s of audio**, while the buffered
+player produced **95.1s** and held its 60s cushion the whole time.
+**Trade-off:** playback is ~60s behind live. For a radio stream nobody can tell,
+so the cushion is nearly free. It also costs a few MB of memory.
+**Reverses:** the `--stream-lavf-o=reconnect=...` flag added earlier today
+(2026-08-15 — "Detect silent stalls…"). It is removed. It was added on a single
+observation that a stall "recovered after 46s" with it. That was wrong: a
+controlled concurrent A/B showed plain mpv at 0.050x and the reconnect build at
+0.071x — i.e. no real difference, both starving. HLS fetches each segment as its
+own short request, so connection-level retry has little to work with.
+**Method note, worth keeping:** this stream's throughput swings wildly minute to
+minute — the same config measured 1.000x and 0.000x minutes apart, and ffmpeg
+showed the same swings on the same URL. Sequential A/B tests here are worthless;
+they produced two confident and opposite wrong conclusions. Only run competing
+configs **concurrently** against this stream.
+
+## 2026-08-15 — Tune the stall detector to the kind of stall
+**Decision:** `_poll_mpv_state` now watches two clocks, not one: `time-pos`
+(is sound coming out) and `demuxer-cache-time` (are bytes arriving). Frozen
+playback while the cache still fills is an ordinary rebuffer and gets
+`STALL_TIMEOUT_SECONDS` (60). Frozen playback with a frozen cache means nothing
+is arriving at all and gets `NO_DATA_TIMEOUT_SECONDS` (30).
+**Why:** a single timer cannot tell "nearly refilled" from "connection is dead",
+so it has to assume the hopeful case and make every dead stream wait out the
+long timeout. Verified live in the running app: the first version restarted a
+wedged mpv after ~100s; splitting the cases cuts the dead-connection path to
+~33s while still letting a genuine rebuffer finish.
+**Status:** with the buffering fix above, this should now rarely fire. It stays
+as the backstop, since the wedge state is unrecoverable when it does happen.
