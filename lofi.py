@@ -46,6 +46,16 @@ SAFARI_UA = (
     "Version/17.0 Safari/605.1.15"
 )
 EARLY_EXIT_SECONDS = 6
+# How long mpv's playback clock may stand still before we give up on the stream
+# and reconnect from scratch. mpv keeps running (and reports pause=false) when a
+# live stream stalls, so process death alone can't detect it.
+#
+# This is deliberately long. Measured on the LofiGirl stream: with ffmpeg's
+# reconnect options (below) a stall recovered on its own after 46s. A restart
+# costs several seconds of silence plus a fresh yt-dlp resolve, so it is only
+# worth doing once self-healing has clearly failed — hence ~2x the observed
+# worst-case recovery.
+STALL_TIMEOUT_SECONDS = 90
 
 # Media-key plumbing. NX_SYSDEFINED (14) is the CGEvent type that carries
 # Apple's special keys; key code 16 (NX_KEYTYPE_PLAY) is Play/Pause.
@@ -486,6 +496,14 @@ class LofiPlayer(rumps.App):
                     # internal pause — the app owns play/stop, and a self-paused
                     # mpv would keep the process + YouTube connection alive.
                     "--input-media-keys=no",
+                    # Let ffmpeg re-open the HTTP connection when the live
+                    # stream drops mid-play. Without this mpv wedges in
+                    # paused-for-cache forever: still running, pause=false, but
+                    # silent — the app looks like it's playing with no sound.
+                    # Measured: turns an otherwise permanent stall into a ~46s
+                    # gap that recovers by itself.
+                    "--stream-lavf-o=reconnect=1,reconnect_streamed=1,"
+                    "reconnect_delay_max=5",
                     f"--volume={self.volume}",
                     f"--input-ipc-server={MPV_SOCKET}",
                     "--ytdl-format=91",
@@ -520,16 +538,20 @@ class LofiPlayer(rumps.App):
         # Survived startup — playback is healthy, so reset the retry budget.
         self._retry_count = 0
 
-    def _handle_unexpected_exit(self, proc):
-        """Decide what to do when mpv dies unexpectedly: auto-retry or surface an
-        error. Both watcher threads route through here; the lock + identity check
-        ensure a single death is handled exactly once."""
+    def _handle_unexpected_exit(self, proc, stalled=False):
+        """Decide what to do when mpv stops playing unexpectedly — because it
+        died, or because it stalled (stalled=True) and we killed it: auto-retry
+        or surface an error. Both watcher threads route through here; the lock +
+        identity check ensure a single death is handled exactly once."""
         with self._resolve_lock:
             if self.process is not proc:
                 return  # another watcher already handled this death
             self.process = None  # claim it; also stops _poll_mpv_state's loop
             msg = self._last_error_line()
-            if self._is_bot_challenge(msg):
+            # A stall says nothing about bot challenges, and stderr may still
+            # hold a stale warning from an earlier attempt — don't let that
+            # misread block the reconnect.
+            if self._is_bot_challenge(msg) and not stalled:
                 decision = "error"  # never auto-retry — needs a manual solve
             elif self._retry_count < MAX_AUTO_RETRIES:
                 self._retry_count += 1
@@ -588,10 +610,19 @@ class LofiPlayer(rumps.App):
         self._open_yt_auth_window()
 
     def _poll_mpv_state(self, proc):
-        """Watch for mpv dying after a healthy start (e.g. the live stream
-        ended) and auto-heal. mpv can't pause itself (--input-media-keys=no) and
-        the app never pauses via IPC, so the only state worth watching is death.
-        Bound to one mpv process so it retires when a reconnect supersedes it."""
+        """Watch a healthy-started mpv for the two ways playback can end:
+
+        1. mpv exits (e.g. the live stream ended).
+        2. mpv stays alive but stops making sound — a stalled network stream
+           leaves it in paused-for-cache/core-idle forever with pause=false, so
+           the app looks like it is playing while the room is silent.
+
+        Case 2 is invisible to process death, so we watch the playback clock
+        instead: if time-pos stops advancing, the stream is gone. Bound to one
+        mpv process so it retires when a reconnect supersedes it."""
+        last_pos = None
+        last_progress = time.time()
+
         while self.process is proc:
             time.sleep(1)
             if self.process is not proc:
@@ -602,6 +633,26 @@ class LofiPlayer(rumps.App):
                 self._handle_unexpected_exit(proc)
                 break
 
+            pos = self._get_mpv_property("time-pos")
+            now = time.time()
+            # None means "no reading" (still loading, or IPC hiccup) — that is
+            # not evidence of a stall, so only a repeated identical clock counts.
+            if pos is None or pos != last_pos:
+                last_pos = pos
+                last_progress = now
+                continue
+
+            if now - last_progress >= STALL_TIMEOUT_SECONDS:
+                # Alive but silent. Kill it ourselves, otherwise the stuck mpv
+                # lingers holding the socket and its dead YouTube connection.
+                self._stderr_buffer.append(
+                    "Stream stalled — no audio for "
+                    f"{STALL_TIMEOUT_SECONDS}s (connection dropped)"
+                )
+                self._terminate(proc)
+                self._handle_unexpected_exit(proc, stalled=True)
+                break
+
     def _send_mpv_command(self, cmd):
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -610,9 +661,42 @@ class LofiPlayer(rumps.App):
             sock.sendall((json.dumps(cmd) + "\n").encode())
             data = sock.recv(4096).decode()
             sock.close()
-            return json.loads(data)
+            # mpv can emit event lines alongside the reply; return the reply.
+            for line in data.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and "error" in msg:
+                    return msg
+            return None
         except Exception:
             return None
+
+    def _get_mpv_property(self, name):
+        """Read one mpv property, or None if unavailable/unset."""
+        reply = self._send_mpv_command({"command": ["get_property", name]})
+        if not reply or reply.get("error") != "success":
+            return None
+        return reply.get("data")
+
+    def _terminate(self, proc):
+        """Stop an mpv process, escalating to SIGKILL if it ignores SIGTERM.
+        A stalled mpv is wedged in network I/O and may not exit politely."""
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def toggle(self, _):
         # Stop fully tears down mpv (process + stream); Play always starts a
@@ -739,8 +823,10 @@ class LofiPlayer(rumps.App):
         self.play_pause_button.title = "▶  Play"
         self.title = "♪"
         if self.process:
-            self.process.terminate()
-            self.process = None
+            # Escalate to SIGKILL off the main thread — a stalled mpv can ignore
+            # SIGTERM, and waiting on it here would freeze the menu bar.
+            proc, self.process = self.process, None
+            threading.Thread(target=self._terminate, args=(proc,), daemon=True).start()
 
     def quit_app(self, _):
         self._stop()

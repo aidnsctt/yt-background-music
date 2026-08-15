@@ -138,3 +138,38 @@ lofi; the menu bar always works. This is the conservative direction on purpose:
 the failure mode is "lofi doesn't start", never "lofi hijacks someone else's
 key". For the same reason the CoreAudio probe fails open — any error, or a
 pre-14.4 macOS, degrades to the stop-only behavior rather than guessing.
+
+## 2026-08-15 — Detect silent stalls, and let ffmpeg reconnect through them
+**Decision:** Two layers against "the UI says playing but there is no sound":
+1. mpv now runs with `--stream-lavf-o=reconnect=1,reconnect_streamed=1,
+   reconnect_delay_max=5`, so ffmpeg re-opens the HTTP connection when the live
+   stream drops mid-play.
+2. `_poll_mpv_state` no longer watches only for process death. It polls
+   `time-pos` over IPC every second and, if the playback clock has not moved for
+   `STALL_TIMEOUT_SECONDS` (90), kills mpv and routes through
+   `_handle_unexpected_exit(stalled=True)` to reconnect.
+**Why:** The player kept going silent while the menu still showed it playing.
+Reproduced live on a running instance: mpv was alive with `pause=false` but
+`paused-for-cache=true`, `core-idle=true`, and `time-pos` frozen at the same
+value for minutes. Every health signal the app had was tied to the mpv process
+exiting (2026-06-28 — "Make playback self-healing"), and a wedged mpv never
+exits, so nothing fired and the UI kept lying. This was not rare: a freshly
+launched mpv reproduced the same terminal wedge within a minute.
+**Why the reconnect flags are the primary fix:** measured on the LofiGirl
+stream, a stall that was permanent without them instead froze for 46s and then
+recovered on its own. Preventing the wedge beats restarting after it.
+Restarting is only the backstop for wedges ffmpeg cannot recover from.
+**Why 90s and not 20s:** the first version used 20s, on the assumption that a
+genuine rebuffer recovers in a second or two. Measurement killed that
+assumption — a healthy stream sat frozen for 46.4s and then resumed. A 20s
+threshold would have destroyed a stream that was about to heal itself, and a
+restart costs several seconds of silence plus a fresh yt-dlp resolve. 90s is
+~2x the observed worst-case recovery.
+**Trade-off:** in the wedge case the user hears up to 90s of silence before the
+reconnect starts. That is the price of not fighting ffmpeg's own recovery; the
+menu bar Stop/Play always works immediately.
+**Detail:** a stall skips the bot-challenge check, because stderr can still hold
+a stale challenge warning from an earlier attempt and that would wrongly block
+the reconnect. `_stop` now escalates SIGTERM to SIGKILL on a background thread —
+a stalled mpv can ignore SIGTERM, and waiting on the main thread would freeze
+the menu bar.
