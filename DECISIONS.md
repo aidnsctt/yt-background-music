@@ -241,3 +241,23 @@ rebuffer, if one ever happens, rebuilds a 30s cushion instead of 1s.
 **Trade-off:** playback is 5 min behind live (still meaningless for radio),
 and a genuine rebuffer now costs up to 30s of silence instead of many 1-2s
 blips. Extends 2026-08-15 "Buffer behind the live edge".
+
+## 2026-09-17 — The blips were 403s, not buffering: audio-only format + fresh yt-dlp
+**Decision:** `--ytdl-format=91` becomes `234/233/91` (audio-only first, old
+muxed format as fallback), yt-dlp is upgraded from 2026.06.09 to current, and
+`_handle_unexpected_exit` now logs every automatic mpv restart to stderr.
+**Why:** watching mpv pids showed a metronome: every ~90s mpv died and the app
+restarted it silently, and the ~4s gap (1.5s backoff + yt-dlp resolve) is the
+pause the user heard. Verbose ffmpeg output showed the cause: with the stale
+yt-dlp (android_vr client, muxed formats only) YouTube returned HTTP 403 on
+every media segment about 90s into each session while the playlist itself
+still loaded. The cushion from the entry above does not prevent this, it only
+delays the exit until the cushion drains. Concurrent A/B on the same stream:
+old setup restarted 3 times in the window, yt-dlp 2026.08 + format 234 played
+6.5 min continuously with no underrun. Bonus: 234 is audio-only, so the app
+stops downloading and decoding a 144p video track it discards.
+**Logging:** the log was one line long. The app restarted mpv all morning with
+no trace, which turned a 30-second diagnosis into a 45-minute one.
+**Do not retry:** ffmpeg `reconnect`/`seg_max_retry` options were tested again
+and make it worse (mpv wedges in paused-for-cache instead of exiting in 2s).
+Second time this idea was tried and dropped; see 2026-08-15.

@@ -538,7 +538,11 @@ class LofiPlayer(rumps.App):
                     "--cache-pause-wait=30",
                     f"--volume={self.volume}",
                     f"--input-ipc-server={MPV_SOCKET}",
-                    "--ytdl-format=91",
+                    # 234/233 are audio-only (needs yt-dlp >= 2026.08). 91 is
+                    # the old muxed fallback; with yt-dlp 2026.06 its sessions
+                    # got HTTP 403 on every segment after ~90s, so mpv died and
+                    # restarted every ~90s (the "pause then resume" blips).
+                    "--ytdl-format=234/233/91",
                     f"--ytdl-raw-options={self._build_ytdl_raw_options()}",
                     url,
                 ],
@@ -592,6 +596,9 @@ class LofiPlayer(rumps.App):
                 decision = "error"
 
         if decision == "retry":
+            print(f"mpv exited ({'stalled' if stalled else 'died'}), retry "
+                  f"{self._retry_count}/{MAX_AUTO_RETRIES}: {msg}",
+                  file=sys.stderr, flush=True)
             self._update_ui(lambda: setattr(self, "title", "♪…"))  # reconnecting
             time.sleep(RETRY_BACKOFF_SECONDS)
             if self.is_playing:  # bail if the user hit Stop during the backoff
