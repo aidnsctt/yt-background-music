@@ -26,11 +26,14 @@ from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
 import Quartz
 
 
-# A channel /live URL re-resolves to the current live video on every mpv launch,
-# so the player heals itself when YouTube rotates the livestream's video id.
-STREAM_URL = "https://www.youtube.com/@LofiGirl/live"
-# Last-known-good watch URL, tried as the final attempt if /live can't resolve.
-FALLBACK_STREAM_URL = "https://www.youtube.com/watch?v=rFZHOHl-L8A"
+# Pinned watch URL for the "beats to relax/study to" stream. Lofi Girl runs
+# several livestreams at once (sleep, synthwave, ambience), and the channel
+# /live endpoint picks whichever it likes, which is how we ended up playing
+# city traffic. Update this id when YouTube rotates the stream.
+STREAM_URL = "https://www.youtube.com/watch?v=rFZHOHl-L8A"
+# Tried as the final attempt if the pinned id is dead, so the player still
+# heals itself (with the wrong-stream risk above) rather than going silent.
+FALLBACK_STREAM_URL = "https://www.youtube.com/@LofiGirl/live"
 MAX_AUTO_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.5
 MPV_BIN = "/opt/homebrew/bin/mpv"
@@ -487,8 +490,8 @@ class LofiPlayer(rumps.App):
 
             self._stderr_buffer.clear()
 
-            # The final auto-retry falls back to the last-known-good watch URL in
-            # case the channel /live endpoint itself can't resolve a live video.
+            # The final auto-retry falls back to the channel /live endpoint in
+            # case the pinned watch URL is no longer live.
             url = (
                 FALLBACK_STREAM_URL
                 if self._retry_count >= MAX_AUTO_RETRIES

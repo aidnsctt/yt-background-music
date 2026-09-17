@@ -211,3 +211,14 @@ wedged mpv after ~100s; splitting the cases cuts the dead-connection path to
 ~33s while still letting a genuine rebuffer finish.
 **Status:** with the buffering fix above, this should now rarely fire. It stays
 as the backstop, since the wedge state is unrecoverable when it does happen.
+
+## 2026-09-17 — Pin the stream video id; /live becomes the fallback
+**Decision:** `STREAM_URL` is now the specific "beats to relax/study to" watch
+URL and `@LofiGirl/live` is the last-resort fallback. This reverses the
+2026-08 choice to resolve through `/live` first.
+**Why:** Lofi Girl runs several livestreams at the same time (relax, sleep,
+synthwave, ambience). `/live` returns whichever one YouTube picks, and today
+it picked a city-ambience stream, so the player played background traffic
+instead of music. A pinned id always plays the right stream; the cost is a
+manual id update when YouTube rotates it, which `/live` still covers as the
+final retry so the player never goes fully silent.
