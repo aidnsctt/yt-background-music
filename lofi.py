@@ -30,7 +30,7 @@ import Quartz
 # so the player heals itself when YouTube rotates the livestream's video id.
 STREAM_URL = "https://www.youtube.com/@LofiGirl/live"
 # Last-known-good watch URL, tried as the final attempt if /live can't resolve.
-FALLBACK_STREAM_URL = "https://www.youtube.com/watch?v=X4VbdwhkE10"
+FALLBACK_STREAM_URL = "https://www.youtube.com/watch?v=rFZHOHl-L8A"
 MAX_AUTO_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.5
 MPV_BIN = "/opt/homebrew/bin/mpv"
