@@ -261,3 +261,29 @@ no trace, which turned a 30-second diagnosis into a 45-minute one.
 **Do not retry:** ffmpeg `reconnect`/`seg_max_retry` options were tested again
 and make it worse (mpv wedges in paused-for-cache instead of exiting in 2s).
 Second time this idea was tried and dropped; see 2026-08-15.
+
+## 2026-09-17 — Add a README, and adopt the self-documenting agent instructions
+**Decision:** the repo gets a `README.md` (what the app is, how to run it, where
+the log is, a symptom → cause → action troubleshooting table, and the read-only
+mpv IPC one-liner), and `CLAUDE.md` gains the agent rules used in the other
+repos here: decide and log instead of asking, investigate before fixing, verify
+live before reporting done, keep the README troubleshooting table current, never
+remove logging, and a "Known dead ends" list.
+**Why:** today's 403 diagnosis took 45 minutes instead of 30 seconds, and most
+of that was rediscovering things `DECISIONS.md` already knew — that the log was
+empty, that sequential A/B tests on this stream are worthless, and that the
+ffmpeg reconnect flags had already been rejected once. The log was good at
+holding the *why* of past changes but nothing told a future session to read it
+first, or gave an operator a place to look up a symptom. The README is that
+place; the CLAUDE.md rules are what make a session use it.
+**Wording source:** ported from `/Users/bot/apps/loadem/CLAUDE.md` (updated
+2026-09-15, the newest and most complete of the set) — its "Documentation and
+decision records (MANDATORY)", "Evidence Before Assertion" and "Task Completion
+Convention" sections — with the compact declare-or-do shape from
+`marketing-atso`, which suits a small repo better. Adapted: no `docs/` tree, no
+ADR numbering, no MR gate and no test suite here, so the triggers point at the
+two files that exist (`DECISIONS.md`, `README.md`) and "done" is a live soak
+rather than a green suite.
+**Trade-off:** more instruction text in a one-file project. Accepted because the
+failures here are timing-dependent and only show up after minutes of playing,
+which is exactly the kind of thing a fresh session gets wrong quickly.
