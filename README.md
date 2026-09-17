@@ -47,12 +47,14 @@ misbehaves. The file is replaced on every restart, not appended to.
 ## Check the live player over mpv IPC (read-only)
 
 The app gives mpv a JSON IPC socket at `MPV_SOCKET` in `lofi.py`
-(`/tmp/lofi-mpv.sock` by default). You can read properties from outside the app.
-`get_property` does not change playback.
+(`lofi-mpv.sock` in Python's temp dir, which on macOS is `$TMPDIR`, not
+`/tmp`). You can read properties from outside the app. `get_property` does not
+change playback.
 
 ```bash
+SOCK=$(python3 -c 'import tempfile,os;print(os.path.join(tempfile.gettempdir(),"lofi-mpv.sock"))')
 printf '{"command":["get_property","time-pos"]}\n{"command":["get_property","demuxer-cache-duration"]}\n{"command":["get_property","paused-for-cache"]}\n' \
-  | nc -U -w1 /tmp/lofi-mpv.sock
+  | nc -U -w1 "$SOCK"
 ```
 
 How to read the answer:
