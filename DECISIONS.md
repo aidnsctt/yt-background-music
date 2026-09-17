@@ -222,3 +222,22 @@ it picked a city-ambience stream, so the player played background traffic
 instead of music. A pinned id always plays the right stream; the cost is a
 manual id update when YouTube rotates it, which `/live` still covers as the
 final retry so the player never goes fully silent.
+
+## 2026-09-17 — Deeper live cushion + rebuild it after a rebuffer
+**Decision:** `live_start_index=-12` becomes `-60` (about 5 min behind live),
+`--cache-secs`/`--demuxer-readahead-secs` go to 600, and
+`--cache-pause-wait=30` is added.
+**Why:** the user heard playback pause and resume by itself, many times an
+hour. Sampling the running mpv over IPC showed the real cushion was only ~55s,
+never the 180s the flags asked for: on a live stream mpv cannot read ahead of
+what YouTube has published, so the cushion equals the start offset and no
+more. YouTube's segment delivery stops for 30-60s at a time. When one gap
+outlasted the 55s cushion, mpv's `cache-pause` drained, paused, resumed after
+the default 1s of new data, and from then on sat at the live edge with no
+cushion at all, so every later hiccup paused it again. That is why it went
+from "sometimes" to "a lot" within one session. The playlist holds a 4h DVR
+window, so a 5 min start offset is free. `cache-pause-wait=30` means a
+rebuffer, if one ever happens, rebuilds a 30s cushion instead of 1s.
+**Trade-off:** playback is 5 min behind live (still meaningless for radio),
+and a genuine rebuffer now costs up to 30s of silence instead of many 1-2s
+blips. Extends 2026-08-15 "Buffer behind the live edge".

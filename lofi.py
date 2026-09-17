@@ -522,10 +522,20 @@ class LofiPlayer(rumps.App):
                     # NOTE: do NOT add ffmpeg's `reconnect` options via
                     # --stream-lavf-o here. Tried and reverted — see
                     # DECISIONS.md 2026-08-15.
-                    "--demuxer-lavf-o=live_start_index=-12",
+                    # 2026-09-17: -12 (~60s) was not enough. On a live stream
+                    # the cushion can never grow past the start offset, and
+                    # YouTube's delivery pauses for 30-60s at a time. Once a
+                    # gap drained the 60s cushion, mpv paused, resumed after
+                    # 1s of data (cache-pause-wait default) and then sat at
+                    # the live edge with no cushion, so every later gap paused
+                    # it again. The playlist keeps a 4h DVR window, so start
+                    # 5 min back and rebuild 30s before resuming after a
+                    # rebuffer. See DECISIONS.md 2026-09-17.
+                    "--demuxer-lavf-o=live_start_index=-60",
                     "--cache=yes",
-                    "--cache-secs=180",
-                    "--demuxer-readahead-secs=180",
+                    "--cache-secs=600",
+                    "--demuxer-readahead-secs=600",
+                    "--cache-pause-wait=30",
                     f"--volume={self.volume}",
                     f"--input-ipc-server={MPV_SOCKET}",
                     "--ytdl-format=91",
