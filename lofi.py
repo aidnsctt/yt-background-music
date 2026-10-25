@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
-"""Lofi Hip Hop Radio — macOS menu bar audio player."""
+"""Native macOS menu bar player for YouTube radio and saved mixes."""
 
-import collections
 import ctypes
-import json
 import os
-import socket
 import struct
-import subprocess
-import threading
 import signal
 import sys
-import tempfile
-import time
 import rumps
 import objc
 from AppKit import (
@@ -25,20 +18,10 @@ from PyObjCTools import AppHelper
 from WebKit import WKWebView, WKWebViewConfiguration, WKWebsiteDataStore
 import Quartz
 
+from library import Library, DEFAULT_SOURCE, normalize_url
+from playback import Playback, COOKIES_FILE, is_bot_challenge
+from dialogs import text_dialog, manage_dialog, message
 
-# Pinned watch URL for the "beats to relax/study to" stream. Lofi Girl runs
-# several livestreams at once (sleep, synthwave, ambience), and the channel
-# /live endpoint picks whichever it likes, which is how we ended up playing
-# city traffic. Update this id when YouTube rotates the stream.
-STREAM_URL = "https://www.youtube.com/watch?v=rFZHOHl-L8A"
-# Tried as the final attempt if the pinned id is dead, so the player still
-# heals itself (with the wrong-stream risk above) rather than going silent.
-FALLBACK_STREAM_URL = "https://www.youtube.com/@LofiGirl/live"
-MAX_AUTO_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 1.5
-MPV_BIN = "/opt/homebrew/bin/mpv"
-MPV_SOCKET = os.path.join(tempfile.gettempdir(), "lofi-mpv.sock")
-COOKIES_FILE = os.path.join(tempfile.gettempdir(), "lofi-yt-cookies.txt")
 
 NSWindowStyleMaskTitled = 1 << 0
 NSWindowStyleMaskClosable = 1 << 1
@@ -48,26 +31,6 @@ SAFARI_UA = (
     "AppleWebKit/605.1.15 (KHTML, like Gecko) "
     "Version/17.0 Safari/605.1.15"
 )
-EARLY_EXIT_SECONDS = 6
-# How long mpv's playback clock may stand still before we give up on the stream
-# and reconnect from scratch. mpv keeps running (and reports pause=false) when a
-# live stream stalls, so process death alone can't detect it.
-#
-# Covers the case where bytes are still trickling in but playback never
-# resumes. A restart costs a few seconds of silence plus a fresh yt-dlp
-# resolve, so give a genuine rebuffer room to finish first.
-STALL_TIMEOUT_SECONDS = 60
-# The faster path out of a stall. The clock above can't tell "buffer is
-# refilling, nearly there" from "the connection is dead", so it has to assume
-# the hopeful case and wait. `demuxer-cache-time` does tell them apart: it only
-# moves when bytes actually arrive. If it has not moved at all, nothing is being
-# received and waiting out the longer timeout just adds silence.
-#
-# Measured wedge: cache advanced once to 88% buffered, then stopped dead with
-# playback still frozen — mpv sat waiting forever for a buffer that would never
-# fill. That state is unrecoverable and is what this catches.
-NO_DATA_TIMEOUT_SECONDS = 30
-
 # Media-key plumbing. NX_SYSDEFINED (14) is the CGEvent type that carries
 # Apple's special keys; key code 16 (NX_KEYTYPE_PLAY) is Play/Pause.
 NX_SYSDEFINED = 14
@@ -195,14 +158,13 @@ class LofiPlayer(rumps.App):
             NSApplicationActivationPolicyAccessory
         )
         self.is_playing = False
-        self.process = None
-        # Kept after self.process is cleared so _own_pids() can still recognise a
-        # dying mpv as ours.
-        self._last_process = None
         self.volume = 70
-        self._retry_count = 0
-        self._resolve_lock = threading.Lock()
-        self._stderr_buffer = collections.deque(maxlen=20)
+        self.library = Library()
+        self.source = dict(DEFAULT_SOURCE, is_live=True)
+        self.status = "stopped"
+        self._save_pending = False
+        self._fallback = False
+        self.player = Playback(self._playback_event)
         self._auth_window = None
         self._auth_window_delegate = None
         self._auth_web_view = None
@@ -212,8 +174,11 @@ class LofiPlayer(rumps.App):
 
         self.play_pause_button = rumps.MenuItem("▶  Play", callback=self.toggle)
 
-        label = rumps.MenuItem("lofi hip hop radio")
-        label.set_callback(None)
+        self._now_playing = rumps.MenuItem(self.source["title"])
+        self._detail = rumps.MenuItem("Live radio · Ready")
+        self._restart_item = rumps.MenuItem("Restart from Beginning", callback=self._restart)
+        self._save_item = rumps.MenuItem("Save Current to Favorites…", callback=self._save_current)
+        self._favorite_items = []
 
         self._error_item = rumps.MenuItem("")
         self._error_item.set_callback(None)
@@ -229,18 +194,7 @@ class LofiPlayer(rumps.App):
         self._volume_item = rumps.MenuItem("Volume")
         self._volume_item.set_callback(None)
 
-        self.menu = [
-            label,
-            None,
-            self.play_pause_button,
-            self._error_item,
-            self._retry_item,
-            self._solve_item,
-            None,
-            self._volume_item,
-            None,
-            rumps.MenuItem("Quit", callback=self.quit_app),
-        ]
+        self._rebuild_menu()
 
         # rumps doesn't expose .hidden directly on MenuItem in all versions —
         # fall back to setting the underlying NSMenuItem visibility.
@@ -250,6 +204,9 @@ class LofiPlayer(rumps.App):
 
         self._build_volume_slider()
         self._setup_media_keys()
+        self._refresh_ui()
+        if self.library.error:
+            AppHelper.callAfter(message, "Favorites could not be loaded", self.library.error)
 
     def _make_audio_sessions(self):
         """Build the CoreAudio probe, proving it works before we trust it.
@@ -411,12 +368,10 @@ class LofiPlayer(rumps.App):
     def _own_pids(self):
         """Pids whose audio sessions are ours, not "another app's".
 
-        Includes an mpv that is still winding down: _stop() clears self.process
-        and then terminates it, so for a moment a dying mpv still holds an output
-        session. Without this, a Play press right after Stop would see that
-        session, conclude another app owns the key, and refuse to start."""
+        The worker keeps its process reference until teardown finishes, so a
+        dying mpv does not look like another app during a rapid Stop/Play."""
         pids = {os.getpid()}
-        for proc in (self.process, self._last_process):
+        for proc in (self.player.process,):
             if proc is not None and proc.poll() is None:
                 pids.add(proc.pid)
         return pids
@@ -451,328 +406,193 @@ class LofiPlayer(rumps.App):
         self._send_mpv_volume()
 
     def _send_mpv_volume(self):
-        self._send_mpv_command({"command": ["set_property", "volume", self.volume]})
+        self.player.volume = self.volume
 
-    def _build_ytdl_raw_options(self):
-        # Anonymous by default. Signed-in account cookies (e.g. Chrome's) make
-        # yt-dlp switch to the "tv downgraded" player client, which YouTube now
-        # serves zero formats — extraction fails with "No video formats found".
-        # Only the cookies exported by the in-app challenge solver are used.
-        if os.path.exists(COOKIES_FILE):
-            return f"cookies={COOKIES_FILE},remote-components=ejs:github"
-        return "remote-components=ejs:github"
+    def _rebuild_menu(self):
+        self.menu.clear()
+        for key, item in (
+            ("now", self._now_playing), ("detail", self._detail),
+            ("transport", self.play_pause_button), ("restart", self._restart_item),
+            ("error", self._error_item), ("retry", self._retry_item),
+            ("challenge", self._solve_item), ("volume", self._volume_item),
+        ):
+            self.menu[key] = item
+        self.menu.add(None)
+        self.menu["paste"] = rumps.MenuItem("Play YouTube URL…", callback=self._paste_url)
+        self.menu["save"] = self._save_item
+        self.menu.add(None)
+        self.menu["favorites-label"] = rumps.MenuItem("Favorites")
+        self._favorite_items = []
+        for source in [DEFAULT_SOURCE] + self.library.items:
+            title = source["title"]
+            label = title[:65] + ("…" if len(title) > 65 else "")
+            item = rumps.MenuItem(label, callback=lambda _, source=source: self._select_source(source))
+            item._menuitem.setToolTip_(title + "\n" + source["url"])
+            self.menu["favorite:" + source["url"]] = item
+            self._favorite_items.append((source["url"], item))
+        self.menu.add(None)
+        self.menu["manage"] = rumps.MenuItem("Manage Favorites…", callback=self._manage_favorites)
+        self.menu["quit"] = rumps.MenuItem("Quit", callback=self.quit_app)
 
-    def _drain_stderr(self, stream):
-        try:
-            for raw in iter(stream.readline, b""):
-                line = raw.decode(errors="replace").rstrip()
-                if line:
-                    self._stderr_buffer.append(line)
-        except Exception:
-            pass
-
-    def _last_error_line(self):
-        for line in reversed(self._stderr_buffer):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            low = stripped.lower()
-            if "error" in low or "warn" in low or "sign in" in low:
-                return stripped
-        return self._stderr_buffer[-1].strip() if self._stderr_buffer else ""
-
-    def _start_playback(self):
-        with self._resolve_lock:
-            try:
-                os.unlink(MPV_SOCKET)
-            except FileNotFoundError:
-                pass
-
-            self._stderr_buffer.clear()
-
-            # The final auto-retry falls back to the channel /live endpoint in
-            # case the pinned watch URL is no longer live.
-            url = (
-                FALLBACK_STREAM_URL
-                if self._retry_count >= MAX_AUTO_RETRIES
-                else STREAM_URL
-            )
-
-            self.process = subprocess.Popen(
-                [
-                    MPV_BIN,
-                    "--no-video",
-                    "--no-terminal",
-                    # Don't let mpv grab macOS media keys and toggle its own
-                    # internal pause — the app owns play/stop, and a self-paused
-                    # mpv would keep the process + YouTube connection alive.
-                    "--input-media-keys=no",
-                    # Start ~60s behind the HLS live edge and keep a deep
-                    # buffer. This is what actually stops the "playing but
-                    # silent" bug: at the live edge mpv has no cushion, so the
-                    # first delivery hiccup empties the buffer and it wedges in
-                    # paused-for-cache forever. Measured side by side on the
-                    # same stream: live-edge mpv played 0.0s of audio in 95s
-                    # while this config played 95.1s and held its 60s cushion
-                    # throughout.
-                    #
-                    # Being a minute behind live is meaningless for a radio
-                    # stream, so the cushion is nearly free.
-                    #
-                    # NOTE: do NOT add ffmpeg's `reconnect` options via
-                    # --stream-lavf-o here. Tried and reverted — see
-                    # DECISIONS.md 2026-08-15.
-                    # 2026-09-17: -12 (~60s) was not enough. On a live stream
-                    # the cushion can never grow past the start offset, and
-                    # YouTube's delivery pauses for 30-60s at a time. Once a
-                    # gap drained the 60s cushion, mpv paused, resumed after
-                    # 1s of data (cache-pause-wait default) and then sat at
-                    # the live edge with no cushion, so every later gap paused
-                    # it again. The playlist keeps a 4h DVR window, so start
-                    # 5 min back and rebuild 30s before resuming after a
-                    # rebuffer. See DECISIONS.md 2026-09-17.
-                    "--demuxer-lavf-o=live_start_index=-60",
-                    "--cache=yes",
-                    "--cache-secs=600",
-                    "--demuxer-readahead-secs=600",
-                    "--cache-pause-wait=30",
-                    f"--volume={self.volume}",
-                    f"--input-ipc-server={MPV_SOCKET}",
-                    # 234/233 are audio-only (needs yt-dlp >= 2026.08). 91 is
-                    # the old muxed fallback; with yt-dlp 2026.06 its sessions
-                    # got HTTP 403 on every segment after ~90s, so mpv died and
-                    # restarted every ~90s (the "pause then resume" blips).
-                    "--ytdl-format=234/233/91",
-                    f"--ytdl-raw-options={self._build_ytdl_raw_options()}",
-                    url,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            self._last_process = self.process
-            threading.Thread(
-                target=self._drain_stderr, args=(self.process.stderr,), daemon=True
-            ).start()
-            self._update_ui(lambda: setattr(self, 'title', '♫'))
-            threading.Thread(
-                target=self._watch_for_early_exit, args=(self.process,), daemon=True
-            ).start()
-            threading.Thread(
-                target=self._poll_mpv_state, args=(self.process,), daemon=True
-            ).start()
-
-    def _watch_for_early_exit(self, proc):
-        """If mpv exits within EARLY_EXIT_SECONDS, treat as a failure."""
-        deadline = time.time() + EARLY_EXIT_SECONDS
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                # Give the stderr drain a moment to catch up.
-                time.sleep(0.3)
-                self._handle_unexpected_exit(proc)
-                return
-            time.sleep(0.2)
-        # Survived startup — playback is healthy, so reset the retry budget.
-        self._retry_count = 0
-
-    def _handle_unexpected_exit(self, proc, stalled=False):
-        """Decide what to do when mpv stops playing unexpectedly — because it
-        died, or because it stalled (stalled=True) and we killed it: auto-retry
-        or surface an error. Both watcher threads route through here; the lock +
-        identity check ensure a single death is handled exactly once."""
-        with self._resolve_lock:
-            if self.process is not proc:
-                return  # another watcher already handled this death
-            self.process = None  # claim it; also stops _poll_mpv_state's loop
-            msg = self._last_error_line()
-            # A stall says nothing about bot challenges, and stderr may still
-            # hold a stale warning from an earlier attempt — don't let that
-            # misread block the reconnect.
-            if self._is_bot_challenge(msg) and not stalled:
-                decision = "error"  # never auto-retry — needs a manual solve
-            elif self._retry_count < MAX_AUTO_RETRIES:
-                self._retry_count += 1
-                decision = "retry"
-            else:
-                decision = "error"
-
-        if decision == "retry":
-            print(f"mpv exited ({'stalled' if stalled else 'died'}), retry "
-                  f"{self._retry_count}/{MAX_AUTO_RETRIES}: {msg}",
-                  file=sys.stderr, flush=True)
-            self._update_ui(lambda: setattr(self, "title", "♪…"))  # reconnecting
-            time.sleep(RETRY_BACKOFF_SECONDS)
-            if self.is_playing:  # bail if the user hit Stop during the backoff
-                self._start_playback()
+    def _refresh_ui(self):
+        live = self.source.get("is_live")
+        busy = self.status in ("loading", "reconnecting")
+        self.is_playing = self.status in ("loading", "reconnecting", "playing")
+        self.title = "⚠" if self.status == "error" else "♪…" if busy else "♫" if self.is_playing else "♪"
+        title = self.source.get("title") or "YouTube audio"
+        self._now_playing.title = title[:85] + ("…" if len(title) > 85 else "")
+        self._now_playing._menuitem.setToolTip_(title)
+        kind = "Live radio" if live else "Recorded mix" if live is False else "YouTube audio"
+        suffix = " · Channel fallback" if self._fallback else ""
+        self._detail.title = f"{kind} · {self.status.capitalize()}{suffix}"
+        if busy or (live and self.is_playing):
+            action = "⏹  Stop"
+        elif self.is_playing:
+            action = "⏸  Pause"
+        elif self.status == "paused":
+            action = "▶  Resume"
         else:
-            self._show_error_state()
+            action = "▶  Play"
+        self.play_pause_button.title = action
+        self._set_item_hidden(self._restart_item, live is not False or busy)
+        self._save_item.set_callback(self._save_current if not self.library.contains(self.source["url"]) else None)
+        self._save_item.title = "Saved to Favorites" if self.library.contains(self.source["url"]) else "Save Current to Favorites…"
+        for url, item in self._favorite_items:
+            item.state = int(url == self.source["url"])
 
-    def _is_bot_challenge(self, msg):
-        low = msg.lower()
-        return (
-            "sign in to confirm" in low
-            or "not a bot" in low
-            or "use --cookies" in low
-        )
-
-    def _show_error_state(self):
-        msg = self._last_error_line() or "Playback failed — check /tmp/lofi-player.log"
-        truncated = (msg[:80] + "…") if len(msg) > 80 else msg
-        needs_challenge = self._is_bot_challenge(msg)
-
+    def _playback_event(self, generation, status, details):
         def apply():
-            self.is_playing = False
-            self.process = None
-            self.title = "⚠"
-            self.play_pause_button.title = "▶  Play"
-            self._error_item.title = truncated
-            self._set_item_hidden(self._error_item, False)
-            self._set_item_hidden(self._retry_item, False)
-            self._set_item_hidden(self._solve_item, not needs_challenge)
-
+            if generation != self.player.generation:
+                return
+            if status == "metadata":
+                self.source = details["source"]
+                for item in self.library.items:
+                    if item["url"] == self.source["url"]:
+                        self.source["title"] = item["title"]
+                if self._save_pending:
+                    self._save_pending = False
+                    self._persist_favorite(self.source)
+            elif status == "fallback":
+                self._fallback = True
+            else:
+                self.status = status
+                if status == "error":
+                    self._save_pending = False
+                    error = details["message"]
+                    self._error_item.title = error.replace("\n", " ")[:90]
+                    self._error_item._menuitem.setToolTip_(error)
+                    self._set_item_hidden(self._error_item, False)
+                    self._set_item_hidden(self._retry_item, False)
+                    self._set_item_hidden(self._solve_item, not is_bot_challenge(error))
+            self._refresh_ui()
         self._update_ui(apply)
 
     def _clear_error_state(self):
-        def apply():
-            self._set_item_hidden(self._error_item, True)
-            self._set_item_hidden(self._retry_item, True)
-            self._set_item_hidden(self._solve_item, True)
-            self._error_item.title = ""
+        for item in (self._error_item, self._retry_item, self._solve_item):
+            self._set_item_hidden(item, True)
 
-        self._update_ui(apply)
-        self._stderr_buffer.clear()
+    def _select_source(self, source, save=False):
+        self.source = dict(source)
+        self._save_pending = save
+        self._play()
+
+    def _play(self):
+        self._clear_error_state()
+        self._fallback = False
+        self.status = "loading"
+        self.player.play(self.source)
+        self._refresh_ui()
+
+    def toggle(self, _):
+        if self.status in ("loading", "reconnecting") or (self.source.get("is_live") and self.is_playing):
+            self._stop()
+        elif self.status in ("playing", "paused"):
+            self.player.paused = self.status == "playing"
+            self.status = "paused" if self.player.paused else "playing"
+            self._refresh_ui()
+        else:
+            self._play()
+
+    def _restart(self, _):
+        self._play()
 
     def _on_retry_clicked(self, _):
-        self._clear_error_state()
         self._play()
 
     def _on_solve_clicked(self, _):
         self._open_yt_auth_window()
 
-    def _poll_mpv_state(self, proc):
-        """Watch a healthy-started mpv for the two ways playback can end:
-
-        1. mpv exits (e.g. the live stream ended).
-        2. mpv stays alive but stops making sound — a stalled network stream
-           leaves it in paused-for-cache/core-idle forever with pause=false, so
-           the app looks like it is playing while the room is silent.
-
-        Case 2 is invisible to process death, so we watch two clocks instead:
-        `time-pos` (is sound coming out?) and `demuxer-cache-time` (are bytes
-        still arriving?). Frozen playback while the cache still fills is an
-        ordinary rebuffer and gets the long grace period; frozen playback with a
-        frozen cache means nothing is arriving at all, and gets cut short.
-        Bound to one mpv process so it retires when a reconnect supersedes it."""
-        last_pos = None
-        last_cache = None
-        now = time.time()
-        last_progress = now  # playback clock last moved
-        last_data = now      # new bytes last arrived
-
-        while self.process is proc:
-            time.sleep(1)
-            if self.process is not proc:
-                break
-            if proc.poll() is not None:
-                # mpv died after startup (e.g. the live stream ended). Try to
-                # auto-heal by reconnecting; falls back to an error if needed.
-                self._handle_unexpected_exit(proc)
-                break
-
-            pos = self._get_mpv_property("time-pos")
-            cache = self._get_mpv_property("demuxer-cache-time")
-            now = time.time()
-
-            # None means "no reading" (still loading, or IPC hiccup) — that is
-            # not evidence of a stall, so only a repeated identical clock counts.
-            if cache is None or cache != last_cache:
-                last_cache = cache
-                last_data = now
-
-            if pos is None or pos != last_pos:
-                last_pos = pos
-                last_progress = now
-                continue
-
-            # Playback is frozen. How long we tolerate it depends on whether the
-            # stream is still feeding us anything.
-            starved_for = now - last_data
-            stalled_for = now - last_progress
-            if starved_for >= NO_DATA_TIMEOUT_SECONDS:
-                reason = f"no data received for {int(starved_for)}s"
-            elif stalled_for >= STALL_TIMEOUT_SECONDS:
-                reason = f"buffering for {int(stalled_for)}s without recovering"
-            else:
-                continue
-
-            # Alive but silent. Kill it ourselves, otherwise the stuck mpv
-            # lingers holding the socket and its dead YouTube connection.
-            self._stderr_buffer.append(f"Stream stalled — {reason}")
-            self._terminate(proc)
-            self._handle_unexpected_exit(proc, stalled=True)
-            break
-
-    def _send_mpv_command(self, cmd):
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            sock.connect(MPV_SOCKET)
-            sock.sendall((json.dumps(cmd) + "\n").encode())
-            data = sock.recv(4096).decode()
-            sock.close()
-            # mpv can emit event lines alongside the reply; return the reply.
-            for line in data.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(msg, dict) and "error" in msg:
-                    return msg
-            return None
-        except Exception:
-            return None
-
-    def _get_mpv_property(self, name):
-        """Read one mpv property, or None if unavailable/unset."""
-        reply = self._send_mpv_command({"command": ["get_property", name]})
-        if not reply or reply.get("error") != "success":
-            return None
-        return reply.get("data")
-
-    def _terminate(self, proc):
-        """Stop an mpv process, escalating to SIGKILL if it ignores SIGTERM.
-        A stalled mpv is wedged in network I/O and may not exit politely."""
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
+    def _paste_url(self, _):
+        initial = ""
+        while True:
+            result = text_dialog("Play a YouTube link", "Paste a video or live stream URL. Leave Save unchecked to play just for this session.", initial, "Play", True)
+            if result is None:
+                return
+            initial, save = result
             try:
-                proc.kill()
-                proc.wait(timeout=3)
-            except Exception:
-                pass
-        except Exception:
-            pass
+                url = normalize_url(initial)
+            except ValueError as exc:
+                message("Check the YouTube link", str(exc))
+                continue
+            source = next((item for item in [DEFAULT_SOURCE] + self.library.items if item["url"] == url), {"url": url, "title": ""})
+            self._select_source(source, save)
+            return
 
-    def toggle(self, _):
-        # Stop fully tears down mpv (process + stream); Play always starts a
-        # fresh stream. There is deliberately no "resume" — a live radio stream
-        # can't be resumed mid-point, and a kept-alive mpv would leave a YouTube
-        # connection running in the background.
-        if self.is_playing:
-            self._stop()
-        else:
-            self._play()
+    def _persist_favorite(self, source):
+        try:
+            self.library.add(source)
+        except OSError as exc:
+            message("Favorite could not be saved", str(exc))
+            return
+        self._rebuild_menu()
+        self._refresh_ui()
 
-    def _play(self):
-        self._clear_error_state()
-        self._retry_count = 0
-        self.is_playing = True
-        self.play_pause_button.title = "⏹  Stop"
-        self.title = "♪…"
-        threading.Thread(target=self._start_playback, daemon=True).start()
+    def _save_current(self, _):
+        source = dict(self.source)
+        result = text_dialog("Save to Favorites", "Give this video or live stream a name.", source.get("title") or "YouTube audio")
+        if result is None:
+            return
+        title, _ = result
+        if not title:
+            message("A name is required", "Choose a name for this favorite.")
+            return
+        source["title"] = title[:200]
+        if self.source["url"] == source["url"]:
+            self.source["title"] = source["title"]
+        self._persist_favorite(source)
+
+    def _manage_favorites(self, _):
+        selected = 0
+        while self.library.items:
+            action, selected, title = manage_dialog(self.library.items, selected)
+            if action == "done":
+                return
+            items = [dict(item) for item in self.library.items]
+            if action == "rename":
+                if not title:
+                    message("A name is required", "Choose a name for this favorite.")
+                    continue
+                items[selected]["title"] = title[:200]
+            elif action == "remove":
+                items.pop(selected)
+                selected = max(0, selected - 1)
+            elif action in ("up", "down"):
+                target = selected + (-1 if action == "up" else 1)
+                if not 0 <= target < len(items):
+                    continue
+                items[selected], items[target] = items[target], items[selected]
+                selected = target
+            try:
+                self.library.save(items)
+            except OSError as exc:
+                message("Favorites could not be updated", str(exc))
+                return
+            for item in items:
+                if item["url"] == self.source["url"]:
+                    self.source["title"] = item["title"]
+            self._rebuild_menu()
+            self._refresh_ui()
+        message("No saved favorites yet", "Lofi Girl is always available. Use Play YouTube URL… to add your own mixes.")
 
     def _open_yt_auth_window(self):
         """Show a WKWebView so the user can sign in / pass YouTube's bot challenge.
@@ -818,7 +638,8 @@ class LofiPlayer(rumps.App):
         )
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
-        url = NSURL.URLWithString_(STREAM_URL)
+        self._auth_generation = self.player.generation
+        url = NSURL.URLWithString_(self.source["url"])
         web_view.loadRequest_(NSURLRequest.requestWithURL_(url))
         window.makeKeyAndOrderFront_(None)
 
@@ -844,12 +665,11 @@ class LofiPlayer(rumps.App):
                     "Lofi", "", "Cookies saved — retrying playback"
                 )
             except Exception as exc:
-                self._stderr_buffer.append(f"cookie export failed: {exc}")
-                self._show_error_state()
+                message("Could not save YouTube cookies", str(exc))
                 return
             # Stop any zombie mpv first, then start fresh.
-            self._stop()
-            self._play()
+            if self._auth_generation == self.player.generation:
+                self._play()
 
         store.getAllCookies_(on_cookies)
 
@@ -877,20 +697,18 @@ class LofiPlayer(rumps.App):
             f.write("\n".join(lines) + "\n")
 
     def _stop(self):
-        self.is_playing = False
-        self.play_pause_button.title = "▶  Play"
-        self.title = "♪"
-        if self.process:
-            # Escalate to SIGKILL off the main thread — a stalled mpv can ignore
-            # SIGTERM, and waiting on it here would freeze the menu bar.
-            proc, self.process = self.process, None
-            threading.Thread(target=self._terminate, args=(proc,), daemon=True).start()
+        self.player.stop()
+        self._save_pending = False
+        self.status = "stopped"
+        self._refresh_ui()
 
     def quit_app(self, _):
-        self._stop()
+        self.player.close()
         rumps.quit_application()
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-    LofiPlayer().run()
+    app = LofiPlayer()
+    signal.signal(signal.SIGINT, lambda *_: app.quit_app(None))
+    signal.signal(signal.SIGTERM, lambda *_: app.quit_app(None))
+    app.run()

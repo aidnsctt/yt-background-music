@@ -31,3 +31,6 @@ cookies/
 
 # Temp files
 *.sock
+
+# Conversation mockups and local previews
+output/

@@ -27,5 +27,17 @@ pkill -f "lofi.py" 2>/dev/null || true
 pkill -f "mpv.*lofi-mpv" 2>/dev/null || true
 sleep 0.5
 
-nohup "$PYTHON" "$SCRIPT_DIR/lofi.py" > /tmp/lofi-player.log 2>&1 &
-echo "Lofi player started (PID: $!) using $PYTHON"
+# Detach the session and all standard streams. A bare nohup background child
+# can be reaped when a terminal/automation command session closes.
+"$PYTHON" - "$SCRIPT_DIR/lofi.py" <<'PY'
+import subprocess
+import sys
+
+with open("/tmp/lofi-player.log", "w") as log:
+    process = subprocess.Popen(
+        [sys.executable, sys.argv[1]],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        start_new_session=True,
+    )
+print(f"Lofi player started (PID: {process.pid}) using {sys.executable}")
+PY

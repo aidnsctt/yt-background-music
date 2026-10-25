@@ -287,3 +287,54 @@ rather than a green suite.
 **Trade-off:** more instruction text in a one-file project. Accepted because the
 failures here are timing-dependent and only show up after minutes of playing,
 which is exactly the kind of thing a fresh session gets wrong quickly.
+
+## 2026-10-25 — Native favorites and temporary YouTube playback
+**Decision:** Keep the Classic Mac menu using `rumps`/AppKit. Add native paste-link
+and save dialogs, a pinned Lofi Girl default, direct one-click favorites, and
+native rename/remove/move controls. Store a versioned favorites JSON file under
+`~/Library/Application Support/Lofi Player/` using atomic replacement. Invalid
+files are preserved and writes blocked with a visible explanation. Temporary
+links stay session-only; launch remains silent with the default selected.
+**Why:** The user wants long YouTube mixes without a background Chrome tab and
+explicitly wants native Mac controls, not Electron. Favorites require no account
+or database. Normalize video/share/live links and strip playlist/tracking/time
+parameters so alternate links to the same video don't create duplicate entries.
+Explicit channel `/live` URLs remain distinct because their destination changes.
+**Trade-off:** Manage Favorites uses a native picker plus Rename, Move Up, Move
+Down, and Remove actions, rather than a separate library window. The paste dialog
+has an unchecked Save option; Save Current is available later. Native text fields
+explicitly route standard Command-key editing shortcuts without an Edit menu.
+
+## 2026-10-25 — Separate live radio from recorded mix playback
+**Decision:** Split UI, dialogs, storage and playback into small Python modules.
+One playback worker serializes metadata extraction, process creation, IPC,
+recovery and teardown. Every selection/stop invalidates the prior session; queued
+UI callbacks also check that session. Metadata extraction runs off the main
+thread, is cancellable, and has a deadline. Recorded mixes pause/resume, can
+restart from the beginning, recover near their last position, and stop on EOF.
+**Why:** Extends 2026-06-28 "Stop = full teardown (no keep-alive pause)": its
+reasoning still applies to live radio, but destroying a recorded one-hour mix
+every time the user pauses loses their place. mpv `keep-open` and `eof-reached`
+let us distinguish a completed recording from an unexpected process exit. If EOF
+is substantially before a known duration, treat it as a recoverable truncation.
+Paused clocks are excluded from stall detection.
+**Preserved:** Live start offset, deep buffering, format preference, cookie
+challenge flow, media-key ownership rules, and recovery logging. General audio
+format fallbacks support other YouTube sources. Only the built-in default may
+use the channel fallback from 2026-09-17; it is now indicated in the menu. Custom
+failures never substitute another source. Retry budgets reset after sustained
+playback rather than merely surviving the first six seconds.
+**Trade-offs:** Metadata adds a resolution step for custom links. Playlist-only
+URLs are rejected. Positions are not saved across restarts. mpv runs without
+user config so global looping, scripts or playlists cannot change these rules.
+The restart script now detaches the session and standard streams explicitly:
+bare background `nohup` was being reaped when this automation session ended.
+**Validation:** 14 serial unittest checks passed, including real mpv against a
+silent local WAV, URL normalization, persistence failures, stale selection
+cancellation, retry position, paused-stall exclusion, truncated EOF, and native
+menu/dialog construction. A muted YouTube soak held the default mpv PID for 180
+seconds with an advancing clock and no reconnect. The recorded mix
+`CFGLoQIhmow` resolved its title/duration, paused without clock drift, resumed,
+and reached normal completion after seeking near its end. Native visual/click
+verification through computer control was blocked by app lookup timeouts; these
+checks do not claim that visual verification or a full multi-hour soak occurred.
