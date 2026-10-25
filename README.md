@@ -2,15 +2,23 @@
 
 A native macOS menu-bar audio player for YouTube livestreams and recorded mixes.
 Lofi Girl remains the pinned default; your saved favorites appear directly in
-the menu for one-click playback. Uses AppKit and `rumps`, with no Electron or
+the menu-bar popover for one-click playback. Uses AppKit and `rumps`, with no Electron or
 browser-based player UI.
 
-`lofi.py` owns the native menu and media keys; `dialogs.py` contains AppKit
+`lofi.py` owns app state and media keys; `popover.py` builds the native
+`NSPopover`, SF Symbols, controls, and favorite rows; `dialogs.py` contains AppKit
 dialogs, `library.py` handles favorites, and `playback.py` runs `mpv` (with
 `yt-dlp` behind it). A single background worker resolves links, watches playback
 over mpv's JSON IPC socket, and recovers from failures.
 
 ## Using the player
+
+Click the music note in the menu bar to open the player. The popover follows
+macOS light/dark appearance and closes on outside click or Escape. The large
+header shows the current source and elapsed/total time for recordings; the
+lavender volume slider is separate from the recording's playback-position slider.
+Long favorites lists scroll within the popover. The power button at the bottom
+quits the player.
 
 - **Play YouTube URL…** accepts watch URLs, `youtu.be` share links, `/live/VIDEO`
   links, and explicit channel `/live` URLs. The title loads automatically.
@@ -23,6 +31,10 @@ over mpv's JSON IPC socket, and recovers from failures.
   lets you choose a saved entry, rename it, move it up/down, or remove it.
   Removing a currently playing favorite does not interrupt playback.
 - Recorded videos support **Pause / Resume** and **Restart from Beginning**.
+  Drag the playback-position slider to preview a timestamp, then release to
+  seek. Use the **15-second back/forward** buttons for smaller jumps. Seeking
+  while paused keeps the video paused. These controls are hidden for live radio
+  and unavailable until the recording has loaded.
   A completed mix stops; it does not loop or switch to radio. Automatic recovery
   resumes near the last observed position.
 - Live streams retain **Stop / Play**, deep buffering, and reconnect behavior.
@@ -30,6 +42,11 @@ over mpv's JSON IPC socket, and recovers from failures.
   menu indicates when this happens. Custom links always retry the selected URL.
 - Startup remains silent with Lofi Girl selected. Temporary URLs and playback
   positions are session-only; favorites survive app restarts.
+
+**Saved to Favorites** is a disabled status for a source already in the list;
+it prevents duplicate saves. For an unsaved source that row becomes the
+clickable **Save Current to Favorites…** action. Dialogs return to the popover
+when closed.
 
 Favorites are stored at
 `~/Library/Application Support/Lofi Player/favorites.json` using atomic writes.

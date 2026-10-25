@@ -68,6 +68,17 @@ class LibraryTests(unittest.TestCase):
 
 
 class PlaybackTests(unittest.TestCase):
+    def test_live_playback_ignores_seek_requests(self):
+        engine = playback.Playback(lambda *args: None)
+        class Process:
+            def poll(self):
+                return None
+        engine.seek(120)
+        with patch.object(engine, "_property", return_value=1), patch("playback.ipc") as command, patch.object(engine, "_wait", return_value=False):
+            engine._monitor(0, Process(), {"is_live": True}, 0)
+            command.assert_not_called()
+        engine.close()
+
     def test_live_and_recorded_profiles(self):
         live = playback.mpv_command(dict(DEFAULT_SOURCE, is_live=True), 70)
         vod = playback.mpv_command(dict(DEFAULT_SOURCE, is_live=False), 40, 512)
@@ -180,6 +191,10 @@ class NativeUITests(unittest.TestCase):
                     self.assertEqual(app.source["title"], "Same name")
                     app.status = "playing"
                     app._refresh_ui()
+                    app.source["duration"] = 3700
+                    app._playback_event(app.player.generation, "progress", {"position": 81})
+                    self.assertEqual(app.status, "playing")
+                    self.assertEqual(app.popover.time_label.stringValue(), "1:21 / 1:01:40")
                     app.toggle(None)
                     self.assertTrue(app.player.paused)
                     self.assertEqual(app.play_pause_button.title, "▶  Resume")
@@ -198,7 +213,7 @@ class MpvIntegrationTests(unittest.TestCase):
                 audio.setnchannels(1)
                 audio.setsampwidth(2)
                 audio.setframerate(8000)
-                audio.writeframes(b"\0\0" * 8000 * 3)
+                audio.writeframes(b"\0\0" * 8000 * 8)
             events = []
             engine = playback.Playback(lambda g, s, d: events.append(s), str(Path(directory) / "mpv.sock"))
             original = playback.mpv_command
@@ -211,7 +226,7 @@ class MpvIntegrationTests(unittest.TestCase):
                     time.sleep(.05)
                 self.assertIn(status, events)
             try:
-                with patch.object(engine, "_resolve", side_effect=lambda g, s: dict(s, is_live=False, duration=3)), patch("playback.mpv_command", side_effect=silent_command):
+                with patch.object(engine, "_resolve", side_effect=lambda g, s: dict(s, is_live=False, duration=8)), patch("playback.mpv_command", side_effect=silent_command):
                     engine.play({"url": path, "title": "Silent test"})
                     wait_for("playing")
                     engine.paused = True
@@ -219,7 +234,19 @@ class MpvIntegrationTests(unittest.TestCase):
                     pos = engine._property("time-pos")
                     time.sleep(.8)
                     self.assertAlmostEqual(pos, engine._property("time-pos"), delta=.05)
+                    for destination in (5, 1):
+                        engine.seek(destination)
+                        deadline = time.monotonic() + 3
+                        while time.monotonic() < deadline:
+                            actual = engine._property("time-pos")
+                            if actual is not None and abs(actual - destination) < .25:
+                                break
+                            time.sleep(.05)
+                        self.assertAlmostEqual(engine._property("time-pos"), destination, delta=.25)
+                        self.assertTrue(engine._property("pause"))
                     engine.paused = False
+                    time.sleep(.7)
+                    engine.seek(7)
                     wait_for("finished")
                     self.assertNotIn("error", events)
                     self.assertNotIn("reconnecting", events)

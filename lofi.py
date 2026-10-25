@@ -21,6 +21,7 @@ import Quartz
 from library import Library, DEFAULT_SOURCE, normalize_url
 from playback import Playback, COOKIES_FILE, is_bot_challenge
 from dialogs import text_dialog, manage_dialog, message
+from popover import PlayerPopover
 
 
 NSWindowStyleMaskTitled = 1 << 0
@@ -162,6 +163,8 @@ class LofiPlayer(rumps.App):
         self.library = Library()
         self.source = dict(DEFAULT_SOURCE, is_live=True)
         self.status = "stopped"
+        self.position = 0
+        self.popover = None
         self._save_pending = False
         self._dialog_open = False
         self._fallback = False
@@ -206,8 +209,19 @@ class LofiPlayer(rumps.App):
         self._build_volume_slider()
         self._setup_media_keys()
         self._refresh_ui()
+        self.popover = PlayerPopover(self)
         if self.library.error:
             AppHelper.callAfter(message, "Favorites could not be loaded", self.library.error)
+
+    def run(self, **options):
+        rumps.events.before_start.register(self._install_popover)
+        try:
+            super().run(**options)
+        finally:
+            rumps.events.before_start.unregister(self._install_popover)
+
+    def _install_popover(self):
+        self.popover.install(self._nsapp.nsstatusitem)
 
     def _make_audio_sessions(self):
         """Build the CoreAudio probe, proving it works before we trust it.
@@ -405,6 +419,8 @@ class LofiPlayer(rumps.App):
         self.volume = value
         self._volume_label.setStringValue_(f"{self.volume}%")
         self._send_mpv_volume()
+        if self.popover:
+            self.popover.render()
 
     def _send_mpv_volume(self):
         self.player.volume = self.volume
@@ -439,7 +455,11 @@ class LofiPlayer(rumps.App):
         live = self.source.get("is_live")
         busy = self.status in ("loading", "reconnecting")
         self.is_playing = self.status in ("loading", "reconnecting", "playing")
-        self.title = "⚠" if self.status == "error" else "♪…" if busy else "♫" if self.is_playing else "♪"
+        # Keep the popover's status-item anchor stable during playback changes.
+        # Resizing its title while a button action is running dismisses the
+        # transient popover on recent macOS releases.
+        if self.title != "♪":
+            self.title = "♪"
         title = self.source.get("title") or "YouTube audio"
         self._now_playing.title = title[:85] + ("…" if len(title) > 85 else "")
         self._now_playing._menuitem.setToolTip_(title)
@@ -460,10 +480,17 @@ class LofiPlayer(rumps.App):
         self._save_item.title = "Saved to Favorites" if self.library.contains(self.source["url"]) else "Save Current to Favorites…"
         for url, item in self._favorite_items:
             item.state = int(url == self.source["url"])
+        if self.popover:
+            self.popover.render()
 
     def _playback_event(self, generation, status, details):
         def apply():
             if generation != self.player.generation:
+                return
+            if status == "progress":
+                self.position = details["position"]
+                if self.popover:
+                    self.popover.update_progress()
                 return
             if status == "metadata":
                 self.source = details["source"]
@@ -477,6 +504,8 @@ class LofiPlayer(rumps.App):
                 self._fallback = True
             else:
                 self.status = status
+                if status == "finished":
+                    self.position = self.source.get("duration") or self.position
                 if status == "error":
                     self._save_pending = False
                     error = details["message"]
@@ -501,6 +530,7 @@ class LofiPlayer(rumps.App):
         self._clear_error_state()
         self._fallback = False
         self.status = "loading"
+        self.position = 0
         self.player.play(self.source)
         self._refresh_ui()
 
@@ -517,10 +547,20 @@ class LofiPlayer(rumps.App):
     def _restart(self, _):
         self._play()
 
+    def seek(self, seconds):
+        if self.source.get("is_live") is not False or self.status not in ("playing", "paused"):
+            return
+        duration = self.source.get("duration")
+        if not duration:
+            return
+        self.player.seek(min(max(0, seconds), max(0, duration - .1)))
+
     def _on_retry_clicked(self, _):
         self._play()
 
     def _on_solve_clicked(self, _):
+        if self.popover:
+            self.popover.close()
         self._open_yt_auth_window()
 
     def _paste_url(self, _):
@@ -531,12 +571,16 @@ class LofiPlayer(rumps.App):
         if self._dialog_open:
             return
         self._dialog_open = True
+        if self.popover:
+            self.popover.close()
         self.menu._menu.cancelTracking()
         def open_dialog():
             try:
                 callback()
             finally:
                 self._dialog_open = False
+                if self.popover and self.popover.status_button is not None:
+                    AppHelper.callAfter(self.popover.show)
         AppHelper.callAfter(open_dialog)
 
     def _paste_url_dialog(self):

@@ -76,6 +76,7 @@ class Playback:
         self.volume = 70
         self.paused = False
         self._request = None
+        self._seek_request = None
         self._condition = threading.Condition()
         self._closed = False
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -86,6 +87,7 @@ class Playback:
             self.generation += 1
             self._request = (self.generation, dict(source))
             self.paused = False
+            self._seek_request = None
             self._condition.notify_all()
             return self.generation
 
@@ -94,6 +96,13 @@ class Playback:
             self.generation += 1
             self._request = None
             self.paused = False
+            self._seek_request = None
+            self._condition.notify_all()
+
+    def seek(self, seconds):
+        """Queue an absolute seek; only the current session's worker applies it."""
+        with self._condition:
+            self._seek_request = (self.generation, max(0, float(seconds)))
             self._condition.notify_all()
 
     def close(self):
@@ -246,9 +255,28 @@ class Playback:
         applied_pause = False
         applied_volume = self.volume
         announced = False
+        progress_second = None
         while self._active(generation):
             if proc.poll() is not None:
                 return "died", position
+            with self._condition:
+                seek = self._seek_request
+                self._seek_request = None
+            if seek and seek[0] == generation and not source["is_live"]:
+                destination = seek[1]
+                duration = source.get("duration")
+                if duration:
+                    destination = min(destination, max(0, duration - .1))
+                response = ipc(["seek", destination, "absolute+exact"], self.socket_path)
+                if response and response.get("error") == "success":
+                    position = destination
+                    # Seeking may require a fresh network fetch. Give it the
+                    # same recovery grace as normal playback, including pause.
+                    last_position = None
+                    last_progress = last_data = time.monotonic()
+                    self._emit(generation, "progress", position=destination)
+                else:
+                    print("Seek could not be applied; playback continues", file=sys.stderr, flush=True)
             if applied_volume != self.volume:
                 value = self.volume
                 if ipc(["set_property", "volume", value], self.socket_path):
@@ -271,6 +299,9 @@ class Playback:
             if pos is not None:
                 if not source["is_live"]:
                     position = pos
+                    if int(pos) != progress_second:
+                        progress_second = int(pos)
+                        self._emit(generation, "progress", position=pos)
                 if not announced:
                     announced = True
                     self._emit(generation, "paused" if applied_pause else "playing")

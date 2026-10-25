@@ -371,3 +371,36 @@ updated the native menu correctly. Two consecutive `restart.sh` invocations
 confirmed the old idle app required the force-stop path and exactly one fresh
 instance remained. These are callback/event-loop checks, not a claim of a
 physical menu click for each control.
+
+## 2026-10-25 — Native popover presentation and recorded-video seeking
+**Decision:** Replace the visible standard status menu with an AppKit
+`NSPopover` using native buttons, SF Symbols, text fields, scroll views and
+sliders. Use system appearance colors, a lavender accent, a larger two-line
+now-playing title, elapsed/total time, highlighted favorites, and an accessible
+Quit button. Keep the status icon's width/title stable so playback updates do
+not invalidate the popover anchor. Dialogs close the popover first and reopen it
+after completion or cancellation. Long libraries scroll inside the panel.
+**Why:** The user explicitly approved the mockup and asked to get closer to its
+visual layout while staying native. The earlier "Classic Mac" standard-menu
+implementation could not reproduce its spacing and typography. AppKit supports
+this layout without Electron, a web view, or any new dependency; the existing
+playback/storage code remains in use.
+**Seeking:** Add a native playback-position slider and 15-second back/forward
+buttons for recorded videos only. Dragging previews the timestamp and commits
+one seek on release; keyboard/accessibility changes also seek. Requests are
+serialized on the playback worker, tied to the current generation, clamped to
+the recording duration, cleared on source changes, and ignored for live streams.
+Seeking preserves pause and resets stall timers to allow a fresh network fetch.
+Progress events update timestamps without changing transport state or rebuilding
+controls while dragging. The volume slider remains separate.
+**Validation:** Inspected the real native popover and two-line long-title layout.
+Used native controls to select a favorite, open/cancel the URL dialog and return,
+paste/play a recording, pause, skip forward/back, set playback position to 120s,
+and resume. mpv IPC then showed advancing time at 123.55s with pause=false.
+Selecting the live default hid the seek/skip controls. Mouse-coordinate dragging
+was unavailable through computer control for this popover; native accessibility
+slider changes and real mpv seek behavior were verified instead. Temporary
+preview favorites were isolated from the user's actual library and discarded.
+The serial suite includes forward/backward seeks while paused using real mpv
+with silent local audio, live-seek rejection, and progress/state regression checks.
+All 15 checks passed in the final serial run.
