@@ -1,9 +1,10 @@
 """Small AppKit dialogs. No web UI or additional runtime."""
 
 import objc
+import sys
 from AppKit import (
     NSAlert, NSApplication, NSCommandKeyMask, NSShiftKeyMask, NSKeyDown,
-    NSApplicationActivationPolicyRegular, NSMakeRect, NSView, NSTextField,
+    NSModalPanelWindowLevel, NSMakeRect, NSView, NSTextField,
     NSPopUpButton,
 )
 from Foundation import NSObject
@@ -24,13 +25,22 @@ class EditingField(NSTextField):
 
 def run_alert(alert):
     app = NSApplication.sharedApplication()
-    previous = app.activationPolicy()
-    app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+    # Accessory apps can own key windows. Changing activation policy while a
+    # status menu is dismissing races focus and can leave an inactive modal
+    # window behind other apps, making the status menu appear frozen.
+    alert.layout()
+    window = alert.window()
+    window.setLevel_(NSModalPanelWindowLevel)
+    window.center()
     app.activateIgnoringOtherApps_(True)
+    window.makeKeyAndOrderFront_(None)
+    window.orderFrontRegardless()
+    print(f"dialog opened: {alert.messageText()}", file=sys.stderr, flush=True)
     try:
         return alert.runModal() - 1000
     finally:
-        app.setActivationPolicy_(previous)
+        window.orderOut_(None)
+        print(f"dialog closed: {alert.messageText()}", file=sys.stderr, flush=True)
 
 
 def message(title, detail):

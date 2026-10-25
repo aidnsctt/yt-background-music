@@ -163,6 +163,7 @@ class LofiPlayer(rumps.App):
         self.source = dict(DEFAULT_SOURCE, is_live=True)
         self.status = "stopped"
         self._save_pending = False
+        self._dialog_open = False
         self._fallback = False
         self.player = Playback(self._playback_event)
         self._auth_window = None
@@ -523,6 +524,22 @@ class LofiPlayer(rumps.App):
         self._open_yt_auth_window()
 
     def _paste_url(self, _):
+        self._schedule_dialog(self._paste_url_dialog)
+
+    def _schedule_dialog(self, callback):
+        """Leave the status menu's tracking stack before entering a modal loop."""
+        if self._dialog_open:
+            return
+        self._dialog_open = True
+        self.menu._menu.cancelTracking()
+        def open_dialog():
+            try:
+                callback()
+            finally:
+                self._dialog_open = False
+        AppHelper.callAfter(open_dialog)
+
+    def _paste_url_dialog(self):
         initial = ""
         while True:
             result = text_dialog("Play a YouTube link", "Paste a video or live stream URL. Leave Save unchecked to play just for this session.", initial, "Play", True)
@@ -548,6 +565,9 @@ class LofiPlayer(rumps.App):
         self._refresh_ui()
 
     def _save_current(self, _):
+        self._schedule_dialog(self._save_current_dialog)
+
+    def _save_current_dialog(self):
         source = dict(self.source)
         result = text_dialog("Save to Favorites", "Give this video or live stream a name.", source.get("title") or "YouTube audio")
         if result is None:
@@ -562,6 +582,9 @@ class LofiPlayer(rumps.App):
         self._persist_favorite(source)
 
     def _manage_favorites(self, _):
+        self._schedule_dialog(self._manage_favorites_dialog)
+
+    def _manage_favorites_dialog(self):
         selected = 0
         while self.library.items:
             action, selected, title = manage_dialog(self.library.items, selected)

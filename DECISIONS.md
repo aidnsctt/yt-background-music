@@ -338,3 +338,36 @@ seconds with an advancing clock and no reconnect. The recorded mix
 and reached normal completion after seeking near its end. Native visual/click
 verification through computer control was blocked by app lookup timeouts; these
 checks do not claim that visual verification or a full multi-hour soak occurred.
+
+## 2026-10-25 — Fix dialog focus and reap stale apps on restart
+**Evidence:** On the reported freeze, sampling PID 34653 showed `NSAlert runModal`
+nested under status-menu dismissal, with the playback worker idle and no mpv.
+The paste dialog existed but looked inactive; Cancel dismissed it. Subsequent
+process inspection found old and new app instances alive together despite TERM.
+Python's signal handler was pending while the main thread stayed inside AppKit.
+Duplicate apps sharing the Python bundle ID also explain the earlier unreliable
+computer-control lookups; a timeout was not sufficient evidence of a tool-only
+limitation.
+**Decision:** Defer paste/save/manage dialogs until after menu tracking ends,
+guard against duplicate dialog requests, keep accessory activation policy, and
+explicitly bring the native modal panel forward as a key window. Log dialog
+opening and closing. Restart now waits for old app processes and force-stops
+survivors before launching a replacement, using a script-argument match rather
+than a loose `lofi.py` substring.
+**Why:** The native-controls choice above remains. Switching to Regular inside
+a menu callback was unnecessary for an accessory app to own a key window and
+introduced a focus transition while the menu was still dismissing. A detached
+launch also does not guarantee the previous instance exited: that must be
+checked. This corrects the incomplete restart handling in the preceding entry.
+**Validation:** The corrected dialog was inspected through computer control:
+its text field had a visible focus ring, native paste filled the URL, Play
+closed it and started the chosen recorded mix, and a separate Cancel check
+closed it without playback. The native regression checks pass, including
+deferred opening and duplicate-request suppression.
+An integration run through the actual AppKit event loop exercised the favorite
+selection callback: the default played for 100 seconds with one mpv PID and
+advancing time, then switching to a recorded mix, Pause, Resume, and Stop all
+updated the native menu correctly. Two consecutive `restart.sh` invocations
+confirmed the old idle app required the force-stop path and exactly one fresh
+instance remained. These are callback/event-loop checks, not a claim of a
+physical menu click for each control.

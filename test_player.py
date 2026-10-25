@@ -164,6 +164,15 @@ class NativeUITests(unittest.TestCase):
                 ])
                 app._rebuild_menu()
                 self.assertEqual(len(app._favorite_items), 3)
+                queued, opened = [], []
+                with patch("lofi.AppHelper.callAfter", side_effect=queued.append):
+                    app._schedule_dialog(lambda: opened.append(True))
+                    app._schedule_dialog(lambda: opened.append(False))
+                    self.assertEqual(opened, [])
+                    self.assertEqual(len(queued), 1)
+                    queued.pop()()
+                    self.assertEqual(opened, [True])
+                    self.assertFalse(app._dialog_open)
                 with patch.object(app, "_update_ui", side_effect=lambda fn: fn()):
                     app._playback_event(app.player.generation - 1, "error", {"message": "Old failure"})
                     self.assertEqual(app.status, "stopped")

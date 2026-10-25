@@ -20,10 +20,24 @@ if [ -z "${PYTHON:-}" ]; then
     exit 1
 fi
 
-# Match on the script name only: the venv's python3 resolves to the framework
-# binary ".../Python.app/Contents/MacOS/Python", so "python3.*lofi.py" never
-# matched and old instances survived restarts.
-pkill -f "lofi.py" 2>/dev/null || true
+# Match script arguments, not the interpreter name or arbitrary source text.
+# Python signal handlers can remain pending inside AppKit's native modal/menu
+# loop. Wait for shutdown, then reap survivors before starting another app.
+PLAYER_PATTERN='(^|[ /])lofi[.]py([[:space:]]|$)'
+OLD_PIDS="$(pgrep -f "$PLAYER_PATTERN" || true)"
+if [ -n "$OLD_PIDS" ]; then
+    kill $OLD_PIDS 2>/dev/null || true
+    for _ in {1..30}; do
+        STILL_RUNNING="$(pgrep -f "$PLAYER_PATTERN" || true)"
+        [ -z "$STILL_RUNNING" ] && break
+        sleep 0.1
+    done
+    STILL_RUNNING="$(pgrep -f "$PLAYER_PATTERN" || true)"
+    if [ -n "$STILL_RUNNING" ]; then
+        echo "Stopping unresponsive player instance(s): $STILL_RUNNING"
+        kill -KILL $STILL_RUNNING 2>/dev/null || true
+    fi
+fi
 pkill -f "mpv.*lofi-mpv" 2>/dev/null || true
 sleep 0.5
 
